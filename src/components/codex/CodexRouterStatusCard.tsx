@@ -335,75 +335,77 @@ export function CodexRouterStatusCard() {
                 </div>
               </section>
 
-              <section className="codex-router-manager-section">
-                <div className="codex-router-manager-section-head">
-                  <div>
-                    <span>{t("codex.router.providers", "Provider")}</span>
-                    <strong>{t("codex.router.providersHint", "启用后会刷新 Router 模型目录")}</strong>
-                  </div>
-                  <button type="button" className="codex-router-icon-action" onClick={() => void loadProviders()} disabled={isBusy} title={t("common.shared.refresh", "刷新")}>
-                    <RefreshCw size={14} className={managerAction === "loading" ? "loading-spinner" : ""} />
-                  </button>
-                </div>
-                <div className="codex-router-provider-list">
-                  {providers.map((provider) => {
-                    const providerAction = managerAction?.endsWith(`:${provider.id}`);
-                    return (
-                      <div className="codex-router-provider-row" key={provider.id}>
-                        <div>
-                          <strong>{provider.displayName}</strong>
-                          <span>{provider.kind === "oauth" ? "OAuth" : t("codex.router.apiKeyManaged", "由上游管理 API Key")}</span>
-                        </div>
-                        <div className="codex-router-provider-actions">
-                          {!provider.configured && provider.action === "install" && (
-                            <button type="button" className="btn btn-sm btn-outline" disabled={isBusy} onClick={() => void manage("provider-install", provider)}>
-                              {providerAction ? <RefreshCw size={13} className="loading-spinner" /> : <Download size={13} />}
-                              {t("codex.router.installCli", "安装 CLI")}
-                            </button>
-                          )}
-                          {!provider.configured && provider.action === "login" && (
-                            <button type="button" className="btn btn-sm btn-primary" disabled={isBusy} onClick={() => void manage("provider-login", provider)}>
-                              {providerAction ? <RefreshCw size={13} className="loading-spinner" /> : <Play size={13} />}
-                              {t("codex.router.login", "登录")}
-                            </button>
-                          )}
-                          {provider.configured && (
-                            <button type="button" className={`btn btn-sm ${provider.visible ? "btn-secondary" : "btn-outline"}`} disabled={isBusy} onClick={() => void manage("provider-toggle", provider)}>
-                              {providerAction ? <RefreshCw size={13} className="loading-spinner" /> : <Power size={13} />}
-                              {provider.visible ? t("codex.router.hide", "隐藏") : t("codex.router.show", "显示")}
-                            </button>
-                          )}
-                          {!provider.configured && provider.action === "add-key" && (
-                            <span className="codex-router-provider-pending">{t("codex.router.keyRequired", "请在 Router 中配置密钥")}</span>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                  {status?.installed && providers.length === 0 && !managerAction && (
-                    <div className="codex-router-provider-empty">{t("codex.router.providersEmpty", "暂无 Provider 状态；请刷新或运行诊断。")}</div>
-                  )}
-                </div>
-              </section>
-
-              {doctor && (
+              <div className="codex-router-manager-scroll-area">
                 <section className="codex-router-manager-section">
                   <div className="codex-router-manager-section-head">
                     <div>
-                      <span>{t("codex.router.doctor", "诊断")}</span>
-                      <strong>{doctor.ok ? t("codex.router.doctorPassed", "核心检查通过") : t("codex.router.doctorFailed", "发现需要处理的项目")}</strong>
+                      <span>{t("codex.router.providers", "Provider")}</span>
+                      <strong>{t("codex.router.providersHint", "启用后会刷新 Router 模型目录")}</strong>
                     </div>
+                    <button type="button" className="codex-router-icon-action" onClick={() => void loadProviders()} disabled={isBusy} title={t("common.shared.refresh", "刷新")}>
+                      <RefreshCw size={14} className={managerAction === "loading" ? "loading-spinner" : ""} />
+                    </button>
                   </div>
-                  <div className="codex-router-doctor-list">
-                    {doctor.checks.map((check) => (
-                      <div className={`codex-router-doctor-row ${check.status}`} key={`${check.status}-${check.name}`}>
-                        <span>{check.status.toUpperCase()}</span>
-                        <div><strong>{check.name}</strong><p>{check.detail}</p>{check.fix && <small>{check.fix}</small>}</div>
-                      </div>
-                    ))}
+                  <div className="codex-router-provider-list">
+                    {providers.map((provider) => {
+                      const providerAction = managerAction?.endsWith(`:${provider.id}`);
+                      return (
+                        <div className="codex-router-provider-row" key={provider.id}>
+                          <div>
+                            <strong>{provider.displayName}</strong>
+                            <span>{provider.kind === "oauth" ? "OAuth" : t("codex.router.apiKeyManaged", "由上游管理 API Key")}</span>
+                          </div>
+                          <div className="codex-router-provider-actions">
+                            {!provider.configured && provider.action === "install" && (
+                              <button type="button" className="btn btn-sm btn-outline" disabled={isBusy} onClick={() => void manage("provider-install", provider)}>
+                                {providerAction ? <RefreshCw size={13} className="loading-spinner" /> : <Download size={13} />}
+                                {t("codex.router.installCli", "安装 CLI")}
+                              </button>
+                            )}
+                            {!provider.configured && provider.action === "login" && (
+                              <button type="button" className="btn btn-sm btn-primary" disabled={isBusy} onClick={() => void manage("provider-login", provider)}>
+                                {providerAction ? <RefreshCw size={13} className="loading-spinner" /> : <Play size={13} />}
+                                {t("codex.router.login", "登录")}
+                              </button>
+                            )}
+                            {provider.configured && (
+                              <button type="button" className={`btn btn-sm ${provider.visible ? "btn-secondary" : "btn-outline"}`} disabled={isBusy} onClick={() => void manage("provider-toggle", provider)}>
+                                {providerAction ? <RefreshCw size={13} className="loading-spinner" /> : <Power size={13} />}
+                                {provider.visible ? t("codex.router.hide", "隐藏") : t("codex.router.show", "显示")}
+                              </button>
+                            )}
+                            {!provider.configured && provider.action === "add-key" && (
+                              <span className="codex-router-provider-pending">{t("codex.router.keyRequired", "请在 Router 中配置密钥")}</span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {status?.installed && providers.length === 0 && !managerAction && (
+                      <div className="codex-router-provider-empty">{t("codex.router.providersEmpty", "暂无 Provider 状态；请刷新或运行诊断。")}</div>
+                    )}
                   </div>
                 </section>
-              )}
+
+                {doctor && (
+                  <section className="codex-router-manager-section">
+                    <div className="codex-router-manager-section-head">
+                      <div>
+                        <span>{t("codex.router.doctor", "诊断")}</span>
+                        <strong>{doctor.ok ? t("codex.router.doctorPassed", "核心检查通过") : t("codex.router.doctorFailed", "发现需要处理的项目")}</strong>
+                      </div>
+                    </div>
+                    <div className="codex-router-doctor-list">
+                      {doctor.checks.map((check) => (
+                        <div className={`codex-router-doctor-row ${check.status}`} key={`${check.status}-${check.name}`}>
+                          <span>{check.status.toUpperCase()}</span>
+                          <div><strong>{check.name}</strong><p>{check.detail}</p>{check.fix && <small>{check.fix}</small>}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
+              </div>
 
               {error && <div className="codex-router-error" role="alert"><CircleAlert size={14} /><span>{error}</span></div>}
             </div>
