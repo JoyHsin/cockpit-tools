@@ -210,6 +210,20 @@ fn has_active_codex_router_signed_routing(base_dir: &Path, doc: &Document) -> bo
             == Some(configured_base_url.as_str())
 }
 
+/// Returns whether this Codex home currently contains a Router-owned signed
+/// route that Cockpit may preserve during an OAuth account switch.
+pub fn is_codex_router_signed_routing_active(base_dir: &Path) -> bool {
+    let config_path = get_config_toml_path(base_dir);
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(doc) = crate::modules::codex_config_format::read_codex_config_doc_from_str(&content)
+    else {
+        return false;
+    };
+    has_active_codex_router_signed_routing(base_dir, &doc)
+}
+
 fn is_default_openai_base_url(raw: &str) -> bool {
     raw.trim()
         .eq_ignore_ascii_case(CODEX_DEFAULT_OPENAI_BASE_URL)

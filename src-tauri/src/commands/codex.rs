@@ -13,7 +13,7 @@ use crate::models::codex_local_access::{
 };
 use crate::modules::{
     account, codex_account, codex_local_access, codex_oauth, codex_quota, codex_session_visibility,
-    codex_speed, codex_wakeup, codex_wakeup_scheduler, config, hermes_auth, logger, openclaw_auth,
+    codex_router, codex_speed, codex_wakeup, codex_wakeup_scheduler, config, hermes_auth, logger, openclaw_auth,
     opencode_auth, process,
 };
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,18 @@ const CODEX_BATCH_DELETE_JOBS_DIR: &str = "codex_batch_delete_jobs";
 const CODEX_MAIL_PREVIEW_MAX_BYTES: usize = 512 * 1024;
 static CODEX_BATCH_DELETE_JOBS: LazyLock<Mutex<HashMap<String, CodexBatchDeleteJob>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[tauri::command]
+pub fn codex_router_get_status() -> crate::modules::codex_router::CodexRouterStatus {
+    codex_router::get_status()
+}
+
+#[tauri::command]
+pub fn codex_router_control_service(
+    action: String,
+) -> Result<crate::modules::codex_router::CodexRouterStatus, String> {
+    codex_router::control_service(action.trim())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
