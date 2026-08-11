@@ -224,6 +224,22 @@ pub fn is_codex_router_signed_routing_active(base_dir: &Path) -> bool {
     has_active_codex_router_signed_routing(base_dir, &doc)
 }
 
+/// Cockpit API Service and Codex Router both own the root Codex route. Router
+/// enablement must not overwrite an active Cockpit gateway profile.
+pub fn is_cockpit_local_access_routing_active(base_dir: &Path) -> bool {
+    let config_path = get_config_toml_path(base_dir);
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(doc) = crate::modules::codex_config_format::read_codex_config_doc_from_str(&content)
+    else {
+        return false;
+    };
+    doc.get(CODEX_CONFIG_MODEL_PROVIDER_KEY)
+        .and_then(|item| item.as_str())
+        .is_some_and(|provider| provider.trim() == CODEX_RUNTIME_MODEL_PROVIDER_ID)
+}
+
 fn is_default_openai_base_url(raw: &str) -> bool {
     raw.trim()
         .eq_ignore_ascii_case(CODEX_DEFAULT_OPENAI_BASE_URL)

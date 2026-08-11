@@ -100,7 +100,13 @@ Router 需要提供一个非敏感状态文件（名称以 Router 实际公开�
 
 ### 当前实现进度
 
-已在 Codex 账号总览加入 Router 状态卡：它读取 Router 的非敏感安装清单，显示安装、配置接管、健康状态、版本和已启用 Provider 数量，并且只能调用 Router 官方服务入口执行启动、停止或重启。该入口不会读取、显示或传递 Provider 凭据；安装、升级和 OAuth 登录仍须由后续受控流程完成。
+已在 Codex 账号总览加入 Router 状态卡和管理面板。它读取 Router 的非敏感安装清单，显示安装、配置接管、健康状态、版本和已启用 Provider 数量，并通过 Router 的公开脚本完成以下操作：
+
+- 首次安装时将指定上游仓库浅克隆至 Cockpit 应用数据目录，再运行上游安装器；不会将 Router 源码复制进 Cockpit 仓库。
+- 升级、启用、停用并恢复、启动、停止、重启，以及 `doctor --json` 诊断。
+- Provider 可见性开关、OAuth Provider CLI 安装和登录入口。
+
+Cockpit 不读取、显示、转存或提交 Router 的 OAuth token、验证码和 API Key。需要 API Key 的 Provider 明确保持由 Router 上游配置，避免把第三方密钥扩展到 Cockpit 的凭据边界。
 
 ### 最小可用功能
 
@@ -138,9 +144,9 @@ Router 需要提供一个非敏感状态文件（名称以 Router 实际公开�
 | 阶段 | 产出 | 验收标准 |
 | --- | --- | --- |
 | 1 | 账号切换兼容层与单测（已完成） | 启用 Router 后连续切换两个 ChatGPT/Codex 账号，外部模型仍可见；伪造状态不会被保留。 |
-| 2 | Router 状态与服务生命周期（进行中） | 已完成状态、启停和重启；后续补齐新装、升级、禁用/恢复与完整诊断。 |
-| 3 | Provider/OAuth 管理与状态提示 | OAuth 失效、Router 未运行、上游限流、配置冲突都能准确归因。 |
-| 4 | 跨平台与回归 | macOS、Windows、Linux 上覆盖 Profile 路径、服务管理、代理与恢复；通过 Rust、前端及 sidecar 回归测试。 |
+| 2 | Router 状态与服务生命周期（已完成） | 状态、受控安装、升级、启用/停用、启停/重启和 `doctor` 已接入。 |
+| 3 | Provider/OAuth 管理与状态提示（已完成） | Provider 状态、可见性、CLI 安装和 OAuth 登录入口已接入；密钥仍由 Router 管理。 |
+| 4 | 跨平台与回归（待扩展） | 当前受控安装/启用/停用流程面向 macOS/Linux Shell；Windows 使用 Router 官方安装器。需在具备 Rust 工具链的 CI 覆盖三平台。 |
 
 每次涉及配置投影、模型目录、Base URL、Provider 或认证的改动，都需要同时覆盖：
 
@@ -155,12 +161,14 @@ Router 需要提供一个非敏感状态文件（名称以 Router 实际公开�
 - Router 的状态文件、安装命令、服务协议和模型目录格式必须以其上游稳定 API/CLI 为准；不要依赖未公开的内部文件布局。
 - Codex 对 ChatGPT 登录和自定义 Provider 的限制可能随版本变化，升级 Codex 时须重跑共存模式回归。
 - Router、Provider 和 OAuth 服务各自受其服务条款及限流规则约束；路由接通不代表第三方 OAuth 会话或额度有效。
-- 首个代码改动应只实现第一阶段，并在具备 Rust 工具链的 CI/开发机上运行 `cargo fmt` 与定向单测后再继续 UI 和生命周期功能。
+- 当前工作区未安装 Rust 工具链；提交前已完成前端类型检查和生产构建。应在具备 Rust 工具链的 CI/开发机上补跑 `cargo fmt` 与定向单测。
 
 ## 相关文件
 
 - `src-tauri/src/modules/codex_account.rs`：账号投影与 Router 共存状态校验的落点。
 - `src-tauri/src/modules/codex_local_access.rs`：本地网关生命周期、Profile 接管/恢复和诊断能力的可复用基础。
 - `src-tauri/src/commands/codex.rs`：新增 Tauri 命令的边界。
-- `src/services/codexLocalAccessService.ts` 与 `src/types/codexLocalAccess.ts`：前端桥接与契约。
+- `src-tauri/src/modules/codex_router.rs`：Router 上游脚本的受控调用、状态、Provider 与诊断契约。
+- `src/components/codex/CodexRouterStatusCard.tsx`：账号总览的 Router 状态卡与管理面板。
+- `src/services/codexRouterService.ts` 与 `src/types/codexRouter.ts`：前端桥接与契约。
 - `docs/CODEX_API_SERVICE_HANDOFF.md`：既有 API Service 的实现约束与测试清单。
