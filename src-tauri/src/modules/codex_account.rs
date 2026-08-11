@@ -45,6 +45,9 @@ const CODEX_CONFIG_MODEL_CONTEXT_WINDOW_KEY: &str = "model_context_window";
 const CODEX_CONFIG_MODEL_AUTO_COMPACT_TOKEN_LIMIT_KEY: &str = "model_auto_compact_token_limit";
 const CODEX_MANAGED_MODEL_CATALOG_FILE: &str = "cockpit-provider-model-catalog.json";
 const CODEX_LOCAL_ACCESS_MODEL_CATALOG_FILE: &str = "cockpit-local-access-model-catalog.json";
+const CODEX_ROUTER_SIGNED_PROVIDER_STATE_DIR: &str = "codex-router";
+const CODEX_ROUTER_SIGNED_PROVIDER_STATE_FILE: &str = "signed-provider-mode.json";
+const CODEX_ROUTER_SIGNED_ENDPOINT_MARKER: &str = "/_codex-router/";
 const CODEX_AUTO_REVIEW_MODEL_ID: &str = "codex-auto-review";
 const CODEX_IMAGE_MODEL_ID: &str = "gpt-image-2";
 const CODEX_IMAGEGEN_ACTOR_HEADER: &str = "x-openai-actor-authorization";
@@ -150,6 +153,91 @@ struct ApiProviderConfig {
     base_url: Option<String>,
     provider_id: Option<String>,
     provider_name: Option<String>,
+}
+
+/// Non-secret ownership state written by Codex Router when it runs in the
+/// ChatGPT-compatible signed routing mode.
+///
+/// Cockpit owns account projection; Router owns external-provider routing. We
+/// only preserve Router's config on an account switch when both projections
+/// agree on this routing identity.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRouterSignedProviderState {
+    version: u32,
+    mode: String,
+    managed_provider: String,
+    managed_base_url: String,
+}
+
+fn has_active_codex_router_signed_routing(base_dir: &Path, doc: &Document) -> bool {
+    let configured_base_url = doc
+        .get(CODEX_CONFIG_OPENAI_BASE_URL_KEY)
+        .and_then(|item| item.as_str())
+        .and_then(|value| normalize_api_base_url(Some(value)));
+    let Some(configured_base_url) = configured_base_url else {
+        return false;
+    };
+    if !is_loopback_http_base_url(Some(&configured_base_url))
+        || !configured_base_url.contains(CODEX_ROUTER_SIGNED_ENDPOINT_MARKER)
+    {
+        return false;
+    }
+
+    let configured_provider = doc
+        .get(CODEX_CONFIG_MODEL_PROVIDER_KEY)
+        .and_then(|item| item.as_str())
+        .map(str::trim);
+    if !matches!(configured_provider, None | Some(CODEX_OPENAI_PROVIDER_ID)) {
+        return false;
+    }
+
+    let state_path = base_dir
+        .join(CODEX_ROUTER_SIGNED_PROVIDER_STATE_DIR)
+        .join(CODEX_ROUTER_SIGNED_PROVIDER_STATE_FILE);
+    let state = fs::read_to_string(state_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<CodexRouterSignedProviderState>(&content).ok());
+    let Some(state) = state else {
+        return false;
+    };
+
+    state.version == 3
+        && state.mode == "root-openai"
+        && state.managed_provider == CODEX_OPENAI_PROVIDER_ID
+        && is_loopback_http_base_url(Some(&state.managed_base_url))
+        && normalize_api_base_url(Some(&state.managed_base_url)).as_deref()
+            == Some(configured_base_url.as_str())
+}
+
+/// Returns whether this Codex home currently contains a Router-owned signed
+/// route that Cockpit may preserve during an OAuth account switch.
+pub fn is_codex_router_signed_routing_active(base_dir: &Path) -> bool {
+    let config_path = get_config_toml_path(base_dir);
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(doc) = crate::modules::codex_config_format::read_codex_config_doc_from_str(&content)
+    else {
+        return false;
+    };
+    has_active_codex_router_signed_routing(base_dir, &doc)
+}
+
+/// Cockpit API Service and Codex Router both own the root Codex route. Router
+/// enablement must not overwrite an active Cockpit gateway profile.
+pub fn is_cockpit_local_access_routing_active(base_dir: &Path) -> bool {
+    let config_path = get_config_toml_path(base_dir);
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(doc) = crate::modules::codex_config_format::read_codex_config_doc_from_str(&content)
+    else {
+        return false;
+    };
+    doc.get(CODEX_CONFIG_MODEL_PROVIDER_KEY)
+        .and_then(|item| item.as_str())
+        .is_some_and(|provider| provider.trim() == CODEX_RUNTIME_MODEL_PROVIDER_ID)
 }
 
 fn is_default_openai_base_url(raw: &str) -> bool {
@@ -1105,24 +1193,34 @@ fn write_api_provider_to_config_toml_with_options(
             .map_err(|e| format!("解析 config.toml 失败: {}", e))?
     };
 
+    // A normal Cockpit OAuth account does not have a custom API Base URL. If
+    // Router has proven that it owns the active signed route, keep that route
+    // while replacing only auth.json for the newly selected account.
+    let preserve_codex_router_signed_routing =
+        provider_config.mode == CodexApiProviderMode::OpenaiBuiltin
+            && normalized.is_none()
+            && has_active_codex_router_signed_routing(base_dir, &doc);
+
     match provider_config.mode {
         CodexApiProviderMode::OpenaiBuiltin => {
-            if cleanup_managed_model_catalog {
-                remove_managed_model_catalog_from_doc(&mut doc);
-            }
-            let _ = doc.remove(CODEX_CONFIG_MODEL_PROVIDER_KEY);
-            remove_managed_api_key_model_providers_from_doc(&mut doc);
-            #[cfg(target_os = "windows")]
-            {
-                write_windows_builtin_openai_provider_to_doc(&mut doc, normalized.as_deref())?;
-            }
-            #[cfg(not(target_os = "windows"))]
-            match normalized.as_deref() {
-                Some(base_url) => {
-                    doc[CODEX_CONFIG_OPENAI_BASE_URL_KEY] = value(base_url);
+            if !preserve_codex_router_signed_routing {
+                if cleanup_managed_model_catalog {
+                    remove_managed_model_catalog_from_doc(&mut doc);
                 }
-                None => {
-                    let _ = doc.remove(CODEX_CONFIG_OPENAI_BASE_URL_KEY);
+                let _ = doc.remove(CODEX_CONFIG_MODEL_PROVIDER_KEY);
+                remove_managed_api_key_model_providers_from_doc(&mut doc);
+                #[cfg(target_os = "windows")]
+                {
+                    write_windows_builtin_openai_provider_to_doc(&mut doc, normalized.as_deref())?;
+                }
+                #[cfg(not(target_os = "windows"))]
+                match normalized.as_deref() {
+                    Some(base_url) => {
+                        doc[CODEX_CONFIG_OPENAI_BASE_URL_KEY] = value(base_url);
+                    }
+                    None => {
+                        let _ = doc.remove(CODEX_CONFIG_OPENAI_BASE_URL_KEY);
+                    }
                 }
             }
         }
@@ -11575,6 +11673,112 @@ mod tests {
             latest_tokens.refresh_token.as_deref()
         );
         assert!(synced.token_generation > stored.token_generation);
+    }
+
+    #[test]
+    fn oauth_account_switch_preserves_verified_codex_router_signed_routing() {
+        let base_dir = make_temp_dir("codex-router-signed-routing-preserve-test");
+        let router_dir = base_dir.join("codex-router");
+        fs::create_dir_all(&router_dir).expect("create router state dir");
+        let router_url = "http://127.0.0.1:4102/_codex-router/test-capability/v1";
+        fs::write(
+            base_dir.join("config.toml"),
+            format!(
+                "model = \"grok-oauth/grok-4.5\"\nopenai_base_url = \"{}\"\nmodel_catalog_json = \"{}/codex-router/merged-models.json\"\n\n[model_providers.codex-router]\nname = \"Codex Router (external models)\"\nbase_url = \"{}\"\nwire_api = \"responses\"\n",
+                router_url,
+                base_dir.display(),
+                router_url,
+            ),
+        )
+        .expect("write signed router config");
+        fs::write(
+            router_dir.join("signed-provider-mode.json"),
+            format!(
+                "{{\"version\":3,\"mode\":\"root-openai\",\"managedProvider\":\"openai\",\"managedBaseUrl\":\"{}\",\"ownershipId\":\"0123456789abcdef0123456789abcdef\",\"previousProviderSections\":[]}}",
+                router_url,
+            ),
+        )
+        .expect("write signed router state");
+
+        let provider_config = resolve_api_provider_config(
+            None,
+            Some(CodexApiProviderMode::OpenaiBuiltin),
+            None,
+            None,
+        )
+        .expect("resolve provider config");
+        write_api_provider_to_config_toml(&base_dir, &provider_config)
+            .expect("project switched OAuth account");
+
+        let content = fs::read_to_string(base_dir.join("config.toml")).expect("read config");
+        assert!(content.contains(&format!("openai_base_url = \"{}\"", router_url)));
+        assert!(content.contains("model = \"grok-oauth/grok-4.5\""));
+        assert!(content.contains("model_catalog_json = "));
+        assert!(content.contains("[model_providers.codex-router]"));
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn oauth_account_switch_does_not_preserve_unverified_codex_router_routing() {
+        let base_dir = make_temp_dir("codex-router-signed-routing-unverified-test");
+        let router_url = "http://127.0.0.1:4102/_codex-router/test-capability/v1";
+        fs::write(
+            base_dir.join("config.toml"),
+            format!("openai_base_url = \"{}\"\n", router_url),
+        )
+        .expect("write unverified router config");
+        let provider_config = resolve_api_provider_config(
+            None,
+            Some(CodexApiProviderMode::OpenaiBuiltin),
+            None,
+            None,
+        )
+        .expect("resolve provider config");
+
+        write_api_provider_to_config_toml(&base_dir, &provider_config)
+            .expect("project switched OAuth account");
+
+        let content = fs::read_to_string(base_dir.join("config.toml")).expect("read config");
+        assert!(!content.contains("openai_base_url"));
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn oauth_account_switch_rejects_non_loopback_codex_router_state() {
+        let base_dir = make_temp_dir("codex-router-signed-routing-remote-test");
+        let router_dir = base_dir.join("codex-router");
+        fs::create_dir_all(&router_dir).expect("create router state dir");
+        let router_url = "https://router.example.test/_codex-router/test-capability/v1";
+        fs::write(
+            base_dir.join("config.toml"),
+            format!("openai_base_url = \"{}\"\n", router_url),
+        )
+        .expect("write remote router config");
+        fs::write(
+            router_dir.join("signed-provider-mode.json"),
+            format!(
+                "{{\"version\":3,\"mode\":\"root-openai\",\"managedProvider\":\"openai\",\"managedBaseUrl\":\"{}\",\"ownershipId\":\"0123456789abcdef0123456789abcdef\",\"previousProviderSections\":[]}}",
+                router_url,
+            ),
+        )
+        .expect("write remote router state");
+        let provider_config = resolve_api_provider_config(
+            None,
+            Some(CodexApiProviderMode::OpenaiBuiltin),
+            None,
+            None,
+        )
+        .expect("resolve provider config");
+
+        write_api_provider_to_config_toml(&base_dir, &provider_config)
+            .expect("project switched OAuth account");
+
+        let content = fs::read_to_string(base_dir.join("config.toml")).expect("read config");
+        assert!(!content.contains("openai_base_url"));
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
     }
 
     #[test]

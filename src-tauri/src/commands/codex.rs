@@ -13,7 +13,7 @@ use crate::models::codex_local_access::{
 };
 use crate::modules::{
     account, codex_account, codex_local_access, codex_oauth, codex_quota, codex_session_visibility,
-    codex_speed, codex_wakeup, codex_wakeup_scheduler, config, hermes_auth, logger, openclaw_auth,
+    codex_router, codex_speed, codex_wakeup, codex_wakeup_scheduler, config, hermes_auth, logger, openclaw_auth,
     opencode_auth, process,
 };
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,72 @@ const CODEX_BATCH_DELETE_JOBS_DIR: &str = "codex_batch_delete_jobs";
 const CODEX_MAIL_PREVIEW_MAX_BYTES: usize = 512 * 1024;
 static CODEX_BATCH_DELETE_JOBS: LazyLock<Mutex<HashMap<String, CodexBatchDeleteJob>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[tauri::command]
+pub fn codex_router_get_status() -> crate::modules::codex_router::CodexRouterStatus {
+    codex_router::get_status()
+}
+
+#[tauri::command]
+pub fn codex_router_control_service(
+    action: String,
+) -> Result<crate::modules::codex_router::CodexRouterStatus, String> {
+    codex_router::control_service(action.trim())
+}
+
+#[tauri::command]
+pub fn codex_router_install() -> Result<crate::modules::codex_router::CodexRouterStatus, String> {
+    codex_router::install()
+}
+
+#[tauri::command]
+pub fn codex_router_update() -> Result<crate::modules::codex_router::CodexRouterStatus, String> {
+    codex_router::update()
+}
+
+#[tauri::command]
+pub fn codex_router_enable() -> Result<crate::modules::codex_router::CodexRouterStatus, String> {
+    codex_router::enable()
+}
+
+#[tauri::command]
+pub fn codex_router_disable() -> Result<crate::modules::codex_router::CodexRouterStatus, String> {
+    codex_router::disable()
+}
+
+#[tauri::command]
+pub fn codex_router_list_providers(
+) -> Result<Vec<crate::modules::codex_router::CodexRouterProvider>, String> {
+    codex_router::list_providers()
+}
+
+#[tauri::command]
+pub fn codex_router_set_provider_enabled(
+    provider_id: String,
+    enabled: bool,
+) -> Result<Vec<crate::modules::codex_router::CodexRouterProvider>, String> {
+    codex_router::set_provider_enabled(&provider_id, enabled)
+}
+
+#[tauri::command]
+pub fn codex_router_install_provider_cli(
+    provider_id: String,
+) -> Result<Vec<crate::modules::codex_router::CodexRouterProvider>, String> {
+    codex_router::install_provider_cli(&provider_id)
+}
+
+#[tauri::command]
+pub fn codex_router_login_provider(
+    provider_id: String,
+) -> Result<Vec<crate::modules::codex_router::CodexRouterProvider>, String> {
+    codex_router::login_provider(&provider_id)
+}
+
+#[tauri::command]
+pub fn codex_router_run_doctor(
+) -> Result<crate::modules::codex_router::CodexRouterDoctorReport, String> {
+    codex_router::run_doctor()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

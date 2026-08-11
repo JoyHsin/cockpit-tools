@@ -1,0 +1,435 @@
+.codex-router-card {
+  --router-accent: var(--primary);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--router-accent) 24%, var(--border));
+  border-radius: 15px;
+  background:
+    linear-gradient(122deg, color-mix(in srgb, var(--router-accent) 11%, transparent), transparent 54%),
+    var(--bg-card);
+  box-shadow: 0 12px 28px -25px color-mix(in srgb, var(--router-accent) 65%, transparent);
+}
+
+.codex-router-card.running {
+  --router-accent: #059669;
+}
+
+.codex-router-card.stopped {
+  --router-accent: #d97706;
+}
+
+.codex-router-card.missing {
+  --router-accent: #64748b;
+}
+
+.codex-router-card-topline {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 13px 13px 10px;
+}
+
+.codex-router-card-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid color-mix(in srgb, var(--router-accent) 32%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--router-accent) 13%, transparent);
+  color: var(--router-accent);
+}
+
+.codex-router-card-heading {
+  min-width: 0;
+  flex: 1;
+}
+
+.codex-router-card-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.codex-router-card-title-row h3 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 760;
+  letter-spacing: -0.01em;
+}
+
+.codex-router-card-heading p {
+  margin: 3px 0 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.codex-router-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 18px;
+  padding: 1px 7px;
+  border: 1px solid color-mix(in srgb, var(--router-accent) 28%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--router-accent) 11%, transparent);
+  color: var(--router-accent);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.codex-router-status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.codex-router-icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 27px;
+  height: 27px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--router-accent) 21%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--router-accent) 5%, transparent);
+  color: var(--router-accent);
+  cursor: pointer;
+}
+
+.codex-router-icon-action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--router-accent) 14%, transparent);
+}
+
+.codex-router-icon-action:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.codex-router-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 54px;
+  padding: 0 13px 12px;
+}
+
+.codex-router-metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.codex-router-metadata strong {
+  color: var(--text-primary);
+  font-weight: 720;
+}
+
+.codex-router-safety-note,
+.codex-router-empty-note,
+.codex-router-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.codex-router-safety-note {
+  color: var(--router-accent);
+}
+
+.codex-router-empty-note svg,
+.codex-router-error svg,
+.codex-router-safety-note svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.codex-router-error {
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--danger) 26%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+}
+
+.codex-router-card-actions {
+  display: flex;
+  gap: 7px;
+  padding: 9px 13px;
+  border-top: 1px solid color-mix(in srgb, var(--router-accent) 14%, var(--border));
+  background: color-mix(in srgb, var(--router-accent) 4%, transparent);
+}
+
+.codex-router-card-actions .btn {
+  min-height: 29px;
+}
+
+@media (max-width: 520px) {
+  .codex-router-card-actions .btn {
+    flex: 1;
+    justify-content: center;
+  }
+}
+
+.codex-router-manager-overlay {
+  z-index: 1200;
+  padding: 24px;
+  background: color-mix(in srgb, #0f172a 42%, transparent);
+  backdrop-filter: blur(6px);
+}
+
+.codex-router-manager {
+  width: min(760px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border));
+  border-radius: 18px;
+  background: var(--bg-card);
+  box-shadow: 0 28px 80px -28px rgba(15, 23, 42, 0.56);
+}
+
+.codex-router-manager-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 19px 20px 16px;
+  border-bottom: 1px solid var(--border);
+  background:
+    linear-gradient(128deg, color-mix(in srgb, var(--primary) 15%, transparent), transparent 52%),
+    color-mix(in srgb, var(--bg-card) 95%, var(--primary));
+}
+
+.codex-router-manager-eyebrow {
+  color: var(--primary);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.15em;
+}
+
+.codex-router-manager-header h2 {
+  margin: 4px 0 2px;
+  color: var(--text-primary);
+  font-size: 19px;
+  letter-spacing: -0.03em;
+}
+
+.codex-router-manager-header p {
+  max-width: 540px;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.codex-router-manager-body {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  max-height: calc(min(760px, 100vh - 48px) - 105px);
+  padding: 16px 20px 22px;
+  overflow-y: auto;
+}
+
+.codex-router-manager-section {
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border) 90%, var(--primary));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-card) 93%, var(--bg-tertiary));
+}
+
+.codex-router-manager-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+}
+
+.codex-router-manager-section-head > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.codex-router-manager-section-head span {
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.codex-router-manager-section-head strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.codex-router-manager-actions,
+.codex-router-provider-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.codex-router-manager-actions .btn,
+.codex-router-provider-actions .btn {
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.codex-router-provider-list,
+.codex-router-doctor-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.codex-router-provider-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 66%, transparent);
+}
+
+.codex-router-provider-row:last-child,
+.codex-router-doctor-row:last-child {
+  border-bottom: 0;
+}
+
+.codex-router-provider-row > div:first-child {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.codex-router-provider-row strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.codex-router-provider-row span,
+.codex-router-provider-pending,
+.codex-router-provider-empty {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.codex-router-provider-pending {
+  max-width: 150px;
+  text-align: right;
+}
+
+.codex-router-provider-empty {
+  padding: 16px 12px;
+  text-align: center;
+}
+
+.codex-router-doctor-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 66%, transparent);
+}
+
+.codex-router-doctor-row > span {
+  align-self: start;
+  padding: 3px 4px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text-secondary) 10%, transparent);
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.codex-router-doctor-row.ok > span {
+  background: color-mix(in srgb, var(--success) 13%, transparent);
+  color: var(--success);
+}
+
+.codex-router-doctor-row.warn > span {
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  color: #b45309;
+}
+
+.codex-router-doctor-row.fail > span {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.codex-router-doctor-row strong {
+  display: block;
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.codex-router-doctor-row p,
+.codex-router-doctor-row small {
+  display: block;
+  margin: 3px 0 0;
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.codex-router-doctor-row small {
+  color: var(--primary);
+}
+
+@media (max-width: 650px) {
+  .codex-router-manager-overlay {
+    align-items: flex-end;
+    padding: 0;
+  }
+
+  .codex-router-manager {
+    max-height: 88vh;
+    border-radius: 18px 18px 0 0;
+  }
+
+  .codex-router-manager-header,
+  .codex-router-manager-body {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .codex-router-manager-section-head,
+  .codex-router-provider-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .codex-router-manager-actions,
+  .codex-router-provider-actions {
+    justify-content: flex-start;
+  }
+
+  .codex-router-provider-pending {
+    max-width: none;
+    text-align: left;
+  }
+}

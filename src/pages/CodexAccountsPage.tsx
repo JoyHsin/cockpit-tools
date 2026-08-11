@@ -161,6 +161,7 @@ import {
   type CodexWakeupTestOpenRequest,
 } from "../components/codex/CodexWakeupContent";
 import { CodexModelProviderManager } from "../components/codex/CodexModelProviderManager";
+import { CodexRouterStatusCard } from "../components/codex/CodexRouterStatusCard";
 import { CodexSpeedSelect } from "../components/codex/CodexSpeedSelect";
 import { QuickSettingsPopover } from "../components/QuickSettingsPopover";
 import { useProviderAccountsPage } from "../hooks/useProviderAccountsPage";
@@ -11960,6 +11961,7 @@ export function CodexAccountsPage() {
     }
 
     if (!activeGroupId && !groupByTag) {
+      cards.push(<CodexRouterStatusCard key="codex-router-status" />);
       cards.push(
         ...codexGroups.map((group) => {
           const groupAccounts = resolveGroupAccounts(group);
