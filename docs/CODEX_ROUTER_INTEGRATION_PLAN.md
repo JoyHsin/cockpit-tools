@@ -58,7 +58,7 @@ Codex App / CLI 模型选择器
 
 1. `openai_base_url` 是本地 Router 端点，并含 Router 特有路径标记；
 2. `model_provider` 为空或为内置 `openai`，不存在矛盾的自定义 Provider；
-3. Router 状态文件存在、可解析且版本受支持；
+3. Router 状态文件存在、可解析且为当前支持的 v3 格式；
 4. 状态中的 `mode`、`managedProvider`、规范化后的 `managedBaseUrl` 与 `config.toml` 完全一致。
 
 符合条件时：
