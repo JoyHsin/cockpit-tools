@@ -379,12 +379,19 @@ pub fn get_status() -> CodexRouterStatus {
     status_from_manifest(&codex_home, &state_dir, manifest.as_ref(), None)
 }
 
-/// Delegates a lifecycle action to Router without passing or collecting any
-/// Router provider credentials. Only Router's documented service actions are
-/// accepted here.
+/// Controls the Router card lifecycle without passing or collecting provider
+/// credentials. Starting and stopping from the card also applies or restores
+/// its Codex routing configuration, so Codex never keeps a dead loopback URL.
 pub fn control_service(action: &str) -> Result<CodexRouterStatus, String> {
     if !matches!(action, "start" | "stop" | "restart") {
         return Err("不支持的 Codex Router 服务操作".to_string());
+    }
+
+    if action == "start" {
+        return enable();
+    }
+    if action == "stop" {
+        return disable();
     }
 
     let (codex_home, source_root, manifest) = require_router_source()?;
@@ -422,11 +429,28 @@ pub fn enable() -> Result<CodexRouterStatus, String> {
     }
     let output = run_router_shell_command(&source_root, &codex_home, "enable")?;
     router_action_succeeded(&output, "启用")?;
+    let output = run_node_router_command(
+        &source_root,
+        &codex_home,
+        "control.mjs",
+        &["signed-routing", "on"],
+    )?;
+    router_action_succeeded(&output, "启用 ChatGPT 兼容路由")?;
     Ok(get_status())
 }
 
 pub fn disable() -> Result<CodexRouterStatus, String> {
     let (codex_home, source_root, _) = require_router_source()?;
+    let signed_provider_state = router_state_dir(&codex_home).join(SIGNED_PROVIDER_MODE_FILE);
+    if signed_provider_state.is_file() {
+        let output = run_node_router_command(
+            &source_root,
+            &codex_home,
+            "control.mjs",
+            &["signed-routing", "off"],
+        )?;
+        router_action_succeeded(&output, "停用 ChatGPT 兼容路由")?;
+    }
     let output = run_router_shell_command(&source_root, &codex_home, "disable")?;
     router_action_succeeded(&output, "停用")?;
     Ok(get_status())
