@@ -229,7 +229,7 @@ export function CodexRouterStatusCard() {
               ) : (
                 <Pause size={14} />
               )}
-              {t("codex.router.stop", "停止")}
+              {t("codex.router.stop", "停止并恢复")}
             </button>
           ) : (
             <button
