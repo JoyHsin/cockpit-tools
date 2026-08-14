@@ -58,3 +58,16 @@ export async function loginCodexRouterProvider(
 export async function runCodexRouterDoctor(): Promise<CodexRouterDoctorReport> {
   return await invoke("codex_router_run_doctor");
 }
+
+export async function setCodexRouterProviderKey(
+  providerId: string,
+  apiKey: string,
+): Promise<CodexRouterProvider[]> {
+  return await invoke("codex_router_set_provider_key", { providerId, apiKey });
+}
+
+export async function removeCodexRouterProviderKey(
+  providerId: string,
+): Promise<CodexRouterProvider[]> {
+  return await invoke("codex_router_remove_provider_key", { providerId });
+}

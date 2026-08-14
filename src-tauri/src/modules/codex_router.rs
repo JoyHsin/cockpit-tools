@@ -6,11 +6,12 @@
 
 use crate::modules::codex_account;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const ROUTER_STATE_DIR: &str = "codex-router";
@@ -20,6 +21,7 @@ const DEFAULT_ROUTER_PORT: u16 = 4102;
 const ROUTER_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
 const ROUTER_REPOSITORY_URL: &str = "https://github.com/duolahypercho/codex-router.git";
 const ROUTER_MANAGED_CHECKOUT_DIR: &str = "codex-router-source";
+const MAX_PROVIDER_API_KEY_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +45,11 @@ pub struct CodexRouterProvider {
     pub cli_runnable: Option<bool>,
     pub action: String,
     pub visible: bool,
+    pub credential_label: Option<String>,
+    /// True only when the Router registry says this provider stores an API credential.
+    /// Keyless local providers report kind "api" in onboarding snapshots but must not
+    /// expose configure/remove key actions.
+    pub supports_api_key: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +104,7 @@ struct RouterProviderSnapshotEntry {
     cli_installed: Option<bool>,
     cli_runnable: Option<bool>,
     action: String,
+    credential_label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,8 +158,7 @@ fn router_source_root(manifest: &RouterInstallManifest) -> Option<PathBuf> {
 }
 
 fn is_router_source_root(path: &Path) -> bool {
-    path.join("src").join("service.mjs").is_file()
-        && path.join("src").join("control.mjs").is_file()
+    path.join("src").join("service.mjs").is_file() && path.join("src").join("control.mjs").is_file()
 }
 
 fn existing_router_source_root(manifest: Option<&RouterInstallManifest>) -> Option<PathBuf> {
@@ -188,7 +195,9 @@ fn router_port_from_state(state_dir: &Path) -> u16 {
     if !is_loopback {
         return DEFAULT_ROUTER_PORT;
     }
-    parsed.port_or_known_default().unwrap_or(DEFAULT_ROUTER_PORT)
+    parsed
+        .port_or_known_default()
+        .unwrap_or(DEFAULT_ROUTER_PORT)
 }
 
 fn router_is_listening(state_dir: &Path) -> bool {
@@ -273,6 +282,50 @@ fn run_node_router_command(
         .map_err(|_| "无法启动 Codex Router 控制命令；请检查 Node.js 运行时".to_string())
 }
 
+/// Runs a Router Node control script while feeding secret material only through
+/// the child process stdin pipe. Secrets must never appear in argv, env, URLs,
+/// or error strings returned to the UI.
+fn run_node_router_command_with_stdin(
+    source_root: &Path,
+    codex_home: &Path,
+    script: &str,
+    args: &[&str],
+    stdin_payload: &[u8],
+) -> Result<std::process::Output, String> {
+    let mut command = Command::new(node_binary());
+    command
+        .arg(source_root.join("src").join(script))
+        .args(args)
+        .current_dir(source_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    router_command_environment(&mut command, codex_home);
+
+    let mut child = command
+        .spawn()
+        .map_err(|_| "无法启动 Codex Router 控制命令；请检查 Node.js 运行时".to_string())?;
+
+    {
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("无法写入 Codex Router 控制命令输入".to_string());
+        };
+        if stdin.write_all(stdin_payload).is_err() {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("无法写入 Codex Router 控制命令输入".to_string());
+        }
+        // Close stdin so the child observes EOF and finishes reading the secret.
+    }
+
+    child
+        .wait_with_output()
+        .map_err(|_| "Codex Router 控制命令未正常结束".to_string())
+}
+
 fn run_router_shell_command(
     source_root: &Path,
     codex_home: &Path,
@@ -320,8 +373,8 @@ fn ensure_router_source_for_install() -> Result<PathBuf, String> {
 fn require_router_source() -> Result<(PathBuf, PathBuf, RouterInstallManifest), String> {
     let codex_home = codex_account::get_codex_home();
     let state_dir = router_state_dir(&codex_home);
-    let manifest = read_install_manifest(&state_dir)
-        .ok_or("未检测到受支持的 Codex Router 安装记录")?;
+    let manifest =
+        read_install_manifest(&state_dir).ok_or("未检测到受支持的 Codex Router 安装记录")?;
     let source_root = existing_router_source_root(Some(&manifest))
         .ok_or("Codex Router 安装目录不可用；请使用 Router 上游工具修复安装")?;
     Ok((codex_home, source_root, manifest))
@@ -342,13 +395,130 @@ fn router_action_succeeded(output: &std::process::Output, action: &str) -> Resul
 fn validate_provider_id(provider_id: &str) -> Result<&str, String> {
     let provider_id = provider_id.trim();
     if provider_id.is_empty()
-        || !provider_id
-            .chars()
-            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
+        || !provider_id.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
     {
         return Err("Codex Router Provider 标识不合法".to_string());
     }
     Ok(provider_id)
+}
+
+#[derive(Debug, Clone)]
+struct RegistryProviderMeta {
+    kind: String,
+    keyless: bool,
+    credential_label: Option<String>,
+}
+
+fn collect_registry_json_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let mut ordered: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+    ordered.sort_by_key(|entry| entry.file_name());
+    for entry in ordered {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_registry_json_files(&path, files);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            files.push(path);
+        }
+    }
+}
+
+fn load_registry_provider_meta(source_root: &Path) -> HashMap<String, RegistryProviderMeta> {
+    let mut files = Vec::new();
+    collect_registry_json_files(&source_root.join("config"), &mut files);
+    let mut meta = HashMap::new();
+    for file in files {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let Some(providers) = value.get("providers").and_then(|entry| entry.as_array()) else {
+            continue;
+        };
+        for provider in providers {
+            let Some(id) = provider.get("id").and_then(|entry| entry.as_str()) else {
+                continue;
+            };
+            let kind = provider
+                .get("kind")
+                .and_then(|entry| entry.as_str())
+                .unwrap_or("")
+                .to_string();
+            let has_credential_block = provider.get("credential").is_some();
+            // Registry validation forbids keyless + credential together; missing credential on
+            // openai-compatible is also treated as keyless/local-style.
+            let keyless = provider
+                .get("keyless")
+                .and_then(|entry| entry.as_bool())
+                .unwrap_or(false)
+                || (kind == "openai-compatible" && !has_credential_block);
+            let credential_label = provider
+                .get("credential")
+                .and_then(|entry| entry.get("label"))
+                .and_then(|entry| entry.as_str())
+                .map(|label| label.trim().to_string())
+                .filter(|label| !label.is_empty());
+            meta.insert(
+                id.to_string(),
+                RegistryProviderMeta {
+                    kind,
+                    keyless,
+                    credential_label,
+                },
+            );
+        }
+    }
+    meta
+}
+
+fn provider_supports_api_key_strict(meta: Option<&RegistryProviderMeta>) -> bool {
+    match meta {
+        Some(meta) => is_api_key_provider_kind(&meta.kind) && !meta.keyless,
+        None => false,
+    }
+}
+
+fn is_api_key_provider_kind(kind: &str) -> bool {
+    matches!(kind.trim(), "api" | "openai-compatible")
+}
+
+fn validate_provider_api_key(api_key: &str) -> Result<&str, String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("API Key 不能为空".to_string());
+    }
+    if api_key.len() > MAX_PROVIDER_API_KEY_BYTES {
+        return Err("API Key 超过允许长度".to_string());
+    }
+    Ok(api_key)
+}
+
+fn require_api_key_provider(provider_id: &str) -> Result<String, String> {
+    let provider_id = validate_provider_id(provider_id)?.to_string();
+    let (_, source_root, _) = require_router_source()?;
+    let registry = load_registry_provider_meta(&source_root);
+    let meta = registry.get(&provider_id);
+    if !provider_supports_api_key_strict(meta) {
+        return Err("仅非 keyless 的 API-key Provider 支持在此配置密钥".to_string());
+    }
+    // Still ensure the provider currently appears in the public snapshot.
+    let providers = list_providers()?;
+    if !providers.iter().any(|entry| entry.id == provider_id) {
+        return Err("未找到该 Codex Router Provider".to_string());
+    }
+    Ok(provider_id)
+}
+
+fn credential_action_failed(action: &str) -> String {
+    // Never echo Router stdout/stderr: they may contain user-supplied secrets.
+    format!("Codex Router {}失败", action)
 }
 
 fn status_from_manifest(
@@ -425,7 +595,10 @@ pub fn update() -> Result<CodexRouterStatus, String> {
 pub fn enable() -> Result<CodexRouterStatus, String> {
     let (codex_home, source_root, _) = require_router_source()?;
     if codex_account::is_cockpit_local_access_routing_active(&codex_home) {
-        return Err("Cockpit API Service 正在接管当前 Codex Profile；请先停用该服务再启用 Codex Router".to_string());
+        return Err(
+            "Cockpit API Service 正在接管当前 Codex Profile；请先停用该服务再启用 Codex Router"
+                .to_string(),
+        );
     }
     let output = run_router_shell_command(&source_root, &codex_home, "enable")?;
     router_action_succeeded(&output, "启用")?;
@@ -463,23 +636,38 @@ pub fn list_providers() -> Result<Vec<CodexRouterProvider>, String> {
     let snapshot = serde_json::from_slice::<RouterProviderSnapshot>(&output.stdout)
         .map_err(|_| "Codex Router 返回了无法识别的 Provider 状态".to_string())?;
     let visible = list_provider_visibility(&source_root, &codex_home)?;
+    let registry = load_registry_provider_meta(&source_root);
     Ok(snapshot
         .providers
         .into_iter()
-        .map(|provider| CodexRouterProvider {
-            visible: visible.iter().any(|entry| entry.0 == provider.id && entry.1),
-            id: provider.id,
-            display_name: provider.display_name,
-            kind: provider.kind,
-            configured: provider.configured,
-            cli_installed: provider.cli_installed,
-            cli_runnable: provider.cli_runnable,
-            action: provider.action,
+        .map(|provider| {
+            let meta = registry.get(&provider.id);
+            let supports_api_key = provider_supports_api_key_strict(meta);
+            let credential_label = provider
+                .credential_label
+                .or_else(|| meta.and_then(|entry| entry.credential_label.clone()));
+            CodexRouterProvider {
+                visible: visible
+                    .iter()
+                    .any(|entry| entry.0 == provider.id && entry.1),
+                id: provider.id,
+                display_name: provider.display_name,
+                kind: provider.kind,
+                configured: provider.configured,
+                cli_installed: provider.cli_installed,
+                cli_runnable: provider.cli_runnable,
+                action: provider.action,
+                credential_label,
+                supports_api_key,
+            }
         })
         .collect())
 }
 
-fn list_provider_visibility(source_root: &Path, codex_home: &Path) -> Result<Vec<(String, bool)>, String> {
+fn list_provider_visibility(
+    source_root: &Path,
+    codex_home: &Path,
+) -> Result<Vec<(String, bool)>, String> {
     #[derive(Deserialize)]
     struct Snapshot {
         providers: Vec<Entry>,
@@ -489,7 +677,12 @@ fn list_provider_visibility(source_root: &Path, codex_home: &Path) -> Result<Vec
         id: String,
         visible: bool,
     }
-    let output = run_node_router_command(source_root, codex_home, "providers.mjs", &["list", "--json"])?;
+    let output = run_node_router_command(
+        source_root,
+        codex_home,
+        "providers.mjs",
+        &["list", "--json"],
+    )?;
     router_action_succeeded(&output, "读取 Provider 可见性")?;
     let snapshot = serde_json::from_slice::<Snapshot>(&output.stdout)
         .map_err(|_| "Codex Router 返回了无法识别的 Provider 可见性".to_string())?;
@@ -500,11 +693,19 @@ fn list_provider_visibility(source_root: &Path, codex_home: &Path) -> Result<Vec
         .collect())
 }
 
-pub fn set_provider_enabled(provider_id: &str, enabled: bool) -> Result<Vec<CodexRouterProvider>, String> {
+pub fn set_provider_enabled(
+    provider_id: &str,
+    enabled: bool,
+) -> Result<Vec<CodexRouterProvider>, String> {
     let provider_id = validate_provider_id(provider_id)?;
     let (codex_home, source_root, _) = require_router_source()?;
     let action = if enabled { "enable" } else { "disable" };
-    let output = run_node_router_command(&source_root, &codex_home, "providers.mjs", &[action, provider_id])?;
+    let output = run_node_router_command(
+        &source_root,
+        &codex_home,
+        "providers.mjs",
+        &[action, provider_id],
+    )?;
     router_action_succeeded(&output, "更新 Provider")?;
     list_providers()
 }
@@ -512,7 +713,12 @@ pub fn set_provider_enabled(provider_id: &str, enabled: bool) -> Result<Vec<Code
 pub fn install_provider_cli(provider_id: &str) -> Result<Vec<CodexRouterProvider>, String> {
     let provider_id = validate_provider_id(provider_id)?;
     let (codex_home, source_root, _) = require_router_source()?;
-    let output = run_node_router_command(&source_root, &codex_home, "control.mjs", &["install-cli", provider_id])?;
+    let output = run_node_router_command(
+        &source_root,
+        &codex_home,
+        "control.mjs",
+        &["install-cli", provider_id],
+    )?;
     router_action_succeeded(&output, "安装 Provider CLI")?;
     list_providers()
 }
@@ -520,8 +726,49 @@ pub fn install_provider_cli(provider_id: &str) -> Result<Vec<CodexRouterProvider
 pub fn login_provider(provider_id: &str) -> Result<Vec<CodexRouterProvider>, String> {
     let provider_id = validate_provider_id(provider_id)?;
     let (codex_home, source_root, _) = require_router_source()?;
-    let output = run_node_router_command(&source_root, &codex_home, "control.mjs", &["login", provider_id])?;
+    let output = run_node_router_command(
+        &source_root,
+        &codex_home,
+        "control.mjs",
+        &["login", provider_id],
+    )?;
     router_action_succeeded(&output, "Provider 登录")?;
+    list_providers()
+}
+
+pub fn set_provider_key(
+    provider_id: &str,
+    api_key: &str,
+) -> Result<Vec<CodexRouterProvider>, String> {
+    let provider_id = require_api_key_provider(provider_id)?;
+    let api_key = validate_provider_api_key(api_key)?;
+    let (codex_home, source_root, _) = require_router_source()?;
+    let output = run_node_router_command_with_stdin(
+        &source_root,
+        &codex_home,
+        "control.mjs",
+        &["credential", provider_id.as_str()],
+        api_key.as_bytes(),
+    )?;
+    if !output.status.success() {
+        return Err(credential_action_failed("配置 Provider 密钥"));
+    }
+    // Ignore onboarding JSON stdout; refresh from the public provider snapshot.
+    list_providers()
+}
+
+pub fn remove_provider_key(provider_id: &str) -> Result<Vec<CodexRouterProvider>, String> {
+    let provider_id = require_api_key_provider(provider_id)?;
+    let (codex_home, source_root, _) = require_router_source()?;
+    let output = run_node_router_command(
+        &source_root,
+        &codex_home,
+        "control.mjs",
+        &["credential", provider_id.as_str(), "--remove"],
+    )?;
+    if !output.status.success() {
+        return Err(credential_action_failed("移除 Provider 密钥"));
+    }
     list_providers()
 }
 
@@ -547,7 +794,12 @@ pub fn run_doctor() -> Result<CodexRouterDoctorReport, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{enabled_provider_count, RouterInstallManifest, RouterInstallManifestCurrent};
+    use super::{
+        enabled_provider_count, is_api_key_provider_kind, load_registry_provider_meta,
+        provider_supports_api_key_strict, validate_provider_api_key, validate_provider_id,
+        CodexRouterProvider, RouterInstallManifest, RouterInstallManifestCurrent,
+        RouterProviderSnapshot, MAX_PROVIDER_API_KEY_BYTES,
+    };
 
     #[test]
     fn counts_manifest_provider_entries_without_reading_credentials() {
@@ -564,6 +816,127 @@ mod tests {
             "current": { "sourceRoot": "/tmp/router", "packageVersion": "0.4.0" }
         }))
         .expect("parse manifest");
-        assert_eq!(manifest.current.unwrap().package_version.as_deref(), Some("0.4.0"));
+        assert_eq!(
+            manifest.current.unwrap().package_version.as_deref(),
+            Some("0.4.0")
+        );
+    }
+
+    #[test]
+    fn validates_provider_ids_for_credential_commands() {
+        assert_eq!(validate_provider_id("deepseek").unwrap(), "deepseek");
+        assert_eq!(validate_provider_id(" open-ai-2 ").unwrap(), "open-ai-2");
+        assert!(validate_provider_id("").is_err());
+        assert!(validate_provider_id("OpenAI").is_err());
+        assert!(validate_provider_id("has space").is_err());
+        assert!(validate_provider_id("path/../escape").is_err());
+    }
+
+    #[test]
+    fn validates_api_key_payload_bounds_without_echoing_secret() {
+        assert_eq!(validate_provider_api_key("  sk-test  ").unwrap(), "sk-test");
+        assert!(validate_provider_api_key("").is_err());
+        assert!(validate_provider_api_key("   ").is_err());
+        let too_long = "a".repeat(MAX_PROVIDER_API_KEY_BYTES + 1);
+        let err = validate_provider_api_key(&too_long).unwrap_err();
+        assert!(!err.contains('a'));
+        assert!(err.contains("长度") || err.to_lowercase().contains("length"));
+    }
+
+    #[test]
+    fn only_api_provider_kinds_accept_managed_keys() {
+        assert!(is_api_key_provider_kind("api"));
+        assert!(is_api_key_provider_kind("openai-compatible"));
+        assert!(!is_api_key_provider_kind("oauth"));
+        assert!(!is_api_key_provider_kind("keyless"));
+        assert!(!is_api_key_provider_kind(""));
+    }
+
+    #[test]
+    fn registry_meta_distinguishes_keyless_local_from_api_key_providers() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-router-registry-meta-{stamp}"));
+        let config = root.join("config").join("sample");
+        fs::create_dir_all(&config).expect("create config");
+        fs::write(
+            config.join("providers.json"),
+            r#"{
+              "version": 1,
+              "providers": [
+                {
+                  "id": "deepseek",
+                  "kind": "openai-compatible",
+                  "displayName": "DeepSeek",
+                  "ownedBy": "deepseek",
+                  "baseUrl": "https://api.deepseek.com/v1",
+                  "credential": { "file": "deepseek.key", "environment": ["DEEPSEEK_API_KEY"], "label": "API key" }
+                },
+                {
+                  "id": "local",
+                  "kind": "openai-compatible",
+                  "displayName": "Local",
+                  "ownedBy": "local",
+                  "baseUrl": "http://127.0.0.1:11434/v1",
+                  "keyless": true
+                }
+              ],
+              "models": []
+            }"#,
+        )
+        .expect("write registry");
+
+        let meta = load_registry_provider_meta(&root);
+        assert!(provider_supports_api_key_strict(meta.get("deepseek")));
+        assert!(!provider_supports_api_key_strict(meta.get("local")));
+        assert!(!provider_supports_api_key_strict(None));
+        assert_eq!(
+            meta.get("deepseek")
+                .and_then(|entry| entry.credential_label.as_deref()),
+            Some("API key")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_optional_credential_label_from_provider_snapshot() {
+        let snapshot: RouterProviderSnapshot = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "id": "deepseek",
+                "displayName": "DeepSeek",
+                "kind": "api",
+                "configured": true,
+                "cliInstalled": null,
+                "cliRunnable": null,
+                "action": "ready",
+                "credentialLabel": "Managed API key"
+            }]
+        }))
+        .expect("parse provider snapshot");
+        assert_eq!(
+            snapshot.providers[0].credential_label.as_deref(),
+            Some("Managed API key")
+        );
+
+        let provider = CodexRouterProvider {
+            id: snapshot.providers[0].id.clone(),
+            display_name: snapshot.providers[0].display_name.clone(),
+            kind: snapshot.providers[0].kind.clone(),
+            configured: snapshot.providers[0].configured,
+            cli_installed: snapshot.providers[0].cli_installed,
+            cli_runnable: snapshot.providers[0].cli_runnable,
+            action: snapshot.providers[0].action.clone(),
+            visible: true,
+            credential_label: snapshot.providers[0].credential_label.clone(),
+            supports_api_key: true,
+        };
+        let encoded = serde_json::to_value(&provider).expect("serialize provider");
+        assert_eq!(encoded["credentialLabel"], "Managed API key");
+        assert!(encoded.get("credentialSource").is_none());
+        assert!(encoded.get("credentialPath").is_none());
     }
 }

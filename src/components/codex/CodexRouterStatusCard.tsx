@@ -3,12 +3,16 @@ import { createPortal } from "react-dom";
 import {
   CircleAlert,
   Download,
+  Eye,
+  EyeOff,
+  KeyRound,
   Pause,
   Play,
   Power,
   RefreshCw,
   Route,
   ShieldCheck,
+  Trash2,
   Wrench,
   X,
 } from "lucide-react";
@@ -20,6 +24,7 @@ import type {
   CodexRouterProvider,
   CodexRouterStatus,
 } from "../../types/codexRouter";
+import { isCodexRouterApiKeyProvider } from "../../types/codexRouter";
 import "./CodexRouterStatusCard.css";
 
 export function CodexRouterStatusCard() {
@@ -32,6 +37,11 @@ export function CodexRouterStatusCard() {
   const [showManager, setShowManager] = useState(false);
   const [providers, setProviders] = useState<CodexRouterProvider[]>([]);
   const [doctor, setDoctor] = useState<CodexRouterDoctorReport | null>(null);
+  const [keyEditorProvider, setKeyEditorProvider] = useState<CodexRouterProvider | null>(null);
+  const [keyDraft, setKeyDraft] = useState("");
+  const [keyVisible, setKeyVisible] = useState(false);
+  const [keySaving, setKeySaving] = useState(false);
+  const [keyError, setKeyError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -78,6 +88,71 @@ export function CodexRouterStatusCard() {
       setManagerAction(null);
     }
   }, [loadProviders, status?.installed]);
+
+  const closeKeyEditor = useCallback(() => {
+    setKeyEditorProvider(null);
+    setKeyDraft("");
+    setKeyVisible(false);
+    setKeyError(null);
+    setKeySaving(false);
+  }, []);
+
+  const openKeyEditor = useCallback((provider: CodexRouterProvider) => {
+    setKeyEditorProvider(provider);
+    setKeyDraft("");
+    setKeyVisible(false);
+    setKeyError(null);
+    setKeySaving(false);
+  }, []);
+
+  const saveProviderKey = useCallback(async () => {
+    if (!keyEditorProvider) return;
+    const apiKey = keyDraft.trim();
+    if (!apiKey) {
+      setKeyError(t("codex.router.keyRequiredInput", "请输入 API Key"));
+      return;
+    }
+    setKeySaving(true);
+    setKeyError(null);
+    try {
+      const nextProviders = await codexRouterService.setCodexRouterProviderKey(
+        keyEditorProvider.id,
+        apiKey,
+      );
+      setProviders(nextProviders);
+      setStatus(await codexRouterService.getCodexRouterStatus());
+      setError(null);
+      closeKeyEditor();
+    } catch (cause) {
+      setKeyError(String(cause).replace(/^Error:\s*/, ""));
+    } finally {
+      setKeySaving(false);
+    }
+  }, [closeKeyEditor, keyDraft, keyEditorProvider, t]);
+
+  const removeProviderKey = useCallback(
+    async (provider: CodexRouterProvider) => {
+      const confirmed = window.confirm(
+        t(
+          "codex.router.removeKeyConfirm",
+          "确定移除 {{name}} 的 Cockpit/Router 管理密钥？若环境变量或 Keychain 仍提供凭据，Provider 可能继续显示为已配置。",
+          { name: provider.displayName },
+        ),
+      );
+      if (!confirmed) return;
+      setManagerAction(`provider-remove-key:${provider.id}`);
+      try {
+        setProviders(await codexRouterService.removeCodexRouterProviderKey(provider.id));
+        setStatus(await codexRouterService.getCodexRouterStatus());
+        setError(null);
+      } catch (cause) {
+        setError(String(cause).replace(/^Error:\s*/, ""));
+      } finally {
+        setManagerAction(null);
+      }
+    },
+    [t],
+  );
 
   const manage = useCallback(
     async (
@@ -126,7 +201,7 @@ export function CodexRouterStatusCard() {
     [],
   );
 
-  const isBusy = loading || action !== null || managerAction !== null;
+  const isBusy = loading || action !== null || managerAction !== null || keySaving;
   const statusClass = status?.running
     ? "running"
     : status?.installed
@@ -137,6 +212,21 @@ export function CodexRouterStatusCard() {
     : status?.installed
       ? t("codex.router.statusStopped", "已停止")
       : t("codex.router.statusMissing", "未安装");
+
+  const providerKindLabel = (provider: CodexRouterProvider) => {
+    if (provider.kind === "oauth") return "OAuth";
+    if (isCodexRouterApiKeyProvider(provider)) {
+      return (
+        provider.credentialLabel?.trim() ||
+        t("codex.router.apiKeyDefaultLabel", "API key")
+      );
+    }
+    // keyless local providers also arrive as kind "api" in Router snapshots
+    if (provider.kind === "api" || provider.kind === "openai-compatible") {
+      return t("codex.router.keylessManaged", "无需密钥（本地/上游）");
+    }
+    return t("codex.router.apiKeyManaged", "由上游管理 API Key");
+  };
 
   return (
     <section className={`codex-router-card ${statusClass}`} aria-busy={isBusy}>
@@ -297,7 +387,10 @@ export function CodexRouterStatusCard() {
               <button
                 type="button"
                 className="modal-close"
-                onClick={() => setShowManager(false)}
+                onClick={() => {
+                  closeKeyEditor();
+                  setShowManager(false);
+                }}
                 aria-label={t("common.close", "关闭")}
               >
                 <X size={18} />
@@ -349,11 +442,12 @@ export function CodexRouterStatusCard() {
                   <div className="codex-router-provider-list">
                     {providers.map((provider) => {
                       const providerAction = managerAction?.endsWith(`:${provider.id}`);
+                      const apiKeyProvider = isCodexRouterApiKeyProvider(provider);
                       return (
                         <div className="codex-router-provider-row" key={provider.id}>
                           <div>
                             <strong>{provider.displayName}</strong>
-                            <span>{provider.kind === "oauth" ? "OAuth" : t("codex.router.apiKeyManaged", "由上游管理 API Key")}</span>
+                            <span>{providerKindLabel(provider)}</span>
                           </div>
                           <div className="codex-router-provider-actions">
                             {!provider.configured && provider.action === "install" && (
@@ -368,13 +462,47 @@ export function CodexRouterStatusCard() {
                                 {t("codex.router.login", "登录")}
                               </button>
                             )}
+                            {apiKeyProvider && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="btn btn-sm btn-outline"
+                                  disabled={isBusy}
+                                  onClick={() => openKeyEditor(provider)}
+                                >
+                                  <KeyRound size={13} />
+                                  {provider.configured
+                                    ? t("codex.router.updateKey", "更新密钥")
+                                    : t("codex.router.configureKey", "配置密钥")}
+                                </button>
+                                {provider.configured && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-sm btn-secondary"
+                                    disabled={isBusy}
+                                    onClick={() => void removeProviderKey(provider)}
+                                  >
+                                    {managerAction === `provider-remove-key:${provider.id}` ? (
+                                      <RefreshCw size={13} className="loading-spinner" />
+                                    ) : (
+                                      <Trash2 size={13} />
+                                    )}
+                                    {t("codex.router.removeKey", "移除密钥")}
+                                  </button>
+                                )}
+                              </>
+                            )}
                             {provider.configured && (
                               <button type="button" className={`btn btn-sm ${provider.visible ? "btn-secondary" : "btn-outline"}`} disabled={isBusy} onClick={() => void manage("provider-toggle", provider)}>
-                                {providerAction ? <RefreshCw size={13} className="loading-spinner" /> : <Power size={13} />}
+                                {providerAction && managerAction?.startsWith("provider-toggle:") ? (
+                                  <RefreshCw size={13} className="loading-spinner" />
+                                ) : (
+                                  <Power size={13} />
+                                )}
                                 {provider.visible ? t("codex.router.hide", "隐藏") : t("codex.router.show", "显示")}
                               </button>
                             )}
-                            {!provider.configured && provider.action === "add-key" && (
+                            {!apiKeyProvider && !provider.configured && provider.action === "add-key" && (
                               <span className="codex-router-provider-pending">{t("codex.router.keyRequired", "请在 Router 中配置密钥")}</span>
                             )}
                           </div>
@@ -409,6 +537,112 @@ export function CodexRouterStatusCard() {
 
               {error && <div className="codex-router-error" role="alert"><CircleAlert size={14} /><span>{error}</span></div>}
             </div>
+          </section>
+        </div>
+      , document.body)}
+
+      {keyEditorProvider && createPortal(
+        <div className="modal-overlay codex-router-key-overlay" role="presentation">
+          <section
+            className="modal-content codex-router-key-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="codex-router-key-title"
+          >
+            <header className="codex-router-key-header">
+              <div>
+                <div className="codex-router-manager-eyebrow">API KEY</div>
+                <h2 id="codex-router-key-title">
+                  {keyEditorProvider.configured
+                    ? t("codex.router.updateKeyTitle", "更新 Provider 密钥")
+                    : t("codex.router.configureKeyTitle", "配置 Provider 密钥")}
+                </h2>
+                <p>
+                  {t(
+                    "codex.router.keyEditorHint",
+                    "密钥仅通过安全通道写入 Router，不会写入命令行参数、环境变量或日志。",
+                  )}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={closeKeyEditor}
+                disabled={keySaving}
+                aria-label={t("common.close", "关闭")}
+              >
+                <X size={18} />
+              </button>
+            </header>
+
+            <div className="codex-router-key-body">
+              <span className="codex-router-key-label">
+                {t("codex.router.provider", "Provider")}
+              </span>
+              <div className="codex-router-key-provider">{keyEditorProvider.displayName}</div>
+
+              <label className="codex-router-key-label" htmlFor="codex-router-key-input">
+                {t("codex.router.apiKeyField", "API Key")}
+              </label>
+              <div className="codex-router-key-input-row">
+                <input
+                  id="codex-router-key-input"
+                  className="codex-router-key-input"
+                  type={keyVisible ? "text" : "password"}
+                  value={keyDraft}
+                  autoComplete="new-password"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  disabled={keySaving}
+                  placeholder={t("codex.router.apiKeyPlaceholder", "粘贴供应商 API Key")}
+                  onChange={(event) => setKeyDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void saveProviderKey();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="btn btn-secondary icon-only codex-router-key-toggle"
+                  disabled={keySaving}
+                  onClick={() => setKeyVisible((visible) => !visible)}
+                  title={keyVisible ? t("common.hide", "隐藏") : t("common.show", "显示")}
+                  aria-label={keyVisible ? t("common.hide", "隐藏") : t("common.show", "显示")}
+                >
+                  {keyVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              </div>
+
+              {keyError && (
+                <div className="codex-router-error" role="alert">
+                  <CircleAlert size={14} />
+                  <span>{keyError}</span>
+                </div>
+              )}
+            </div>
+
+            <footer className="codex-router-key-footer">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                disabled={keySaving}
+                onClick={closeKeyEditor}
+              >
+                {t("common.cancel", "取消")}
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={keySaving || !keyDraft.trim()}
+                onClick={() => void saveProviderKey()}
+              >
+                {keySaving ? <RefreshCw size={14} className="loading-spinner" /> : <KeyRound size={14} />}
+                {t("common.save", "保存")}
+              </button>
+            </footer>
           </section>
         </div>
       , document.body)}

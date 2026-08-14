@@ -12,9 +12,9 @@ use crate::models::codex_local_access::{
     CodexLocalAccessTimeoutPreset, CodexLocalAccessTimeouts, CodexLocalAccessUsageEventPage,
 };
 use crate::modules::{
-    account, codex_account, codex_local_access, codex_oauth, codex_quota, codex_session_visibility,
-    codex_router, codex_speed, codex_wakeup, codex_wakeup_scheduler, config, hermes_auth, logger, openclaw_auth,
-    opencode_auth, process,
+    account, codex_account, codex_local_access, codex_oauth, codex_quota, codex_router,
+    codex_session_visibility, codex_speed, codex_wakeup, codex_wakeup_scheduler, config,
+    hermes_auth, logger, openclaw_auth, opencode_auth, process,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -91,6 +91,21 @@ pub fn codex_router_login_provider(
     provider_id: String,
 ) -> Result<Vec<crate::modules::codex_router::CodexRouterProvider>, String> {
     codex_router::login_provider(&provider_id)
+}
+
+#[tauri::command]
+pub fn codex_router_set_provider_key(
+    provider_id: String,
+    api_key: String,
+) -> Result<Vec<crate::modules::codex_router::CodexRouterProvider>, String> {
+    codex_router::set_provider_key(&provider_id, &api_key)
+}
+
+#[tauri::command]
+pub fn codex_router_remove_provider_key(
+    provider_id: String,
+) -> Result<Vec<crate::modules::codex_router::CodexRouterProvider>, String> {
+    codex_router::remove_provider_key(&provider_id)
 }
 
 #[tauri::command]

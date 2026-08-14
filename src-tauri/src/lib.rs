@@ -849,6 +849,8 @@ pub fn run() {
             commands::codex::codex_router_set_provider_enabled,
             commands::codex::codex_router_install_provider_cli,
             commands::codex::codex_router_login_provider,
+            commands::codex::codex_router_set_provider_key,
+            commands::codex::codex_router_remove_provider_key,
             commands::codex::codex_router_run_doctor,
             commands::codex::codex_local_access_get_state,
             commands::codex::codex_local_access_save_accounts,
