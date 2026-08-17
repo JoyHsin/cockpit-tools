@@ -6,7 +6,7 @@ use crate::modules::{account, atomic_write, config, grok_oauth, logger, provider
 use chrono::{DateTime, Utc};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -2519,6 +2519,8 @@ fn save_refreshed_account(
         save_account_locked(account)?;
     }
 
+    crate::modules::unified_model_gateway::mirror_shared_session_after_refresh(account);
+
     if config::get_user_config().grok_sync_official_auth_on_switch
         && !account.is_api_key_auth()
         && provider_current_state::get_current_account_id("grok")?.as_deref()
@@ -2893,6 +2895,279 @@ pub fn run_quota_alert_if_needed() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+pub fn lowest_remaining_percent(account: &GrokAccountView) -> Option<i32> {
+    quota_remaining_metrics(account)
+        .into_iter()
+        .map(|(_, remaining)| remaining)
+        .min()
+}
+
+pub fn mark_account_status(account_id: &str, status: &str) -> Result<(), String> {
+    let _guard = ACCOUNT_LOCK.lock().map_err(|_| "获取 Grok 账号锁失败")?;
+    let _store_guard = acquire_store_lock()?;
+    let mut account =
+        load_account(account_id).ok_or_else(|| format!("Grok 账号不存在: {account_id}"))?;
+    let status = status.trim();
+    if status.is_empty() {
+        account.status = None;
+        account.status_reason = None;
+    } else {
+        account.status = Some(status.to_string());
+        if status == "reauth_required" {
+            account.status_reason = Some("Grok 需要重新授权".to_string());
+        }
+    }
+    save_account_locked(&account)?;
+    Ok(())
+}
+
+fn file_owner_is_current_user(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = fs::metadata(path) else {
+            return false;
+        };
+        meta.uid() == unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+fn file_permissions_are_private(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = fs::metadata(path) else {
+            return false;
+        };
+        meta.permissions().mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+fn inspect_import_candidate(
+    source: &str,
+    path: PathBuf,
+) -> crate::models::unified_model_gateway::UnifiedGrokImportCandidate {
+    use crate::models::unified_model_gateway::UnifiedGrokImportCandidate;
+    let display = path.display().to_string();
+    if !path.exists() {
+        return UnifiedGrokImportCandidate {
+            source: source.to_string(),
+            path: display,
+            identity: String::new(),
+            importable: false,
+            reason: Some("文件不存在".to_string()),
+            ..UnifiedGrokImportCandidate::default()
+        };
+    }
+    if !file_owner_is_current_user(&path) {
+        return UnifiedGrokImportCandidate {
+            source: source.to_string(),
+            path: display,
+            identity: String::new(),
+            importable: false,
+            reason: Some("无法确认所属用户".to_string()),
+            ..UnifiedGrokImportCandidate::default()
+        };
+    }
+    if !file_permissions_are_private(&path) {
+        return UnifiedGrokImportCandidate {
+            source: source.to_string(),
+            path: display,
+            identity: String::new(),
+            importable: false,
+            reason: Some("权限不安全，拒绝导入".to_string()),
+            ..UnifiedGrokImportCandidate::default()
+        };
+    }
+    let Ok(content) = fs::read_to_string(&path) else {
+        return UnifiedGrokImportCandidate {
+            source: source.to_string(),
+            path: display,
+            identity: String::new(),
+            importable: false,
+            reason: Some("无法读取文件".to_string()),
+            ..UnifiedGrokImportCandidate::default()
+        };
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return UnifiedGrokImportCandidate {
+            source: source.to_string(),
+            path: display,
+            identity: String::new(),
+            importable: false,
+            reason: Some("未知格式".to_string()),
+            ..UnifiedGrokImportCandidate::default()
+        };
+    };
+    match parse_auth_registry(&value) {
+        Ok(account) => {
+            let has_refresh = account
+                .refresh_token
+                .as_deref()
+                .and_then(|value| normalize_text(Some(value)))
+                .is_some();
+            let identity = account
+                .principal_id
+                .clone()
+                .or(account.user_id.clone())
+                .unwrap_or_else(|| account.email.clone());
+            let already = find_existing_account(&account).is_some();
+            UnifiedGrokImportCandidate {
+                source: source.to_string(),
+                path: display,
+                identity,
+                email: Some(account.email),
+                expires_at: account.expires_at,
+                already_managed: already,
+                importable: has_refresh,
+                reason: (!has_refresh).then(|| "不含 refresh token".to_string()),
+            }
+        }
+        Err(error) => UnifiedGrokImportCandidate {
+            source: source.to_string(),
+            path: display,
+            identity: String::new(),
+            importable: false,
+            reason: Some(error),
+            ..UnifiedGrokImportCandidate::default()
+        },
+    }
+}
+
+pub fn discover_local_import_candidates(
+) -> Result<Vec<crate::models::unified_model_gateway::UnifiedGrokImportCandidate>, String> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let push = |candidates: &mut Vec<_>,
+                seen: &mut HashSet<String>,
+                source: &str,
+                path: PathBuf| {
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key) {
+            candidates.push(inspect_import_candidate(source, path));
+        }
+    };
+
+    if let Ok(profiles) = profiles_dir() {
+        if let Ok(entries) = fs::read_dir(profiles) {
+            for entry in entries.flatten() {
+                let auth = entry.path().join(AUTH_FILE);
+                if auth.exists() {
+                    push(&mut candidates, &mut seen, "cockpit_profile", auth);
+                }
+            }
+        }
+    }
+
+    if let Some(cli_path) = crate::modules::config::get_user_config().grok_cli_path {
+        let cli = PathBuf::from(cli_path);
+        if let Some(parent) = cli.parent() {
+            push(
+                &mut candidates,
+                &mut seen,
+                "grok_cli_path",
+                parent.join(DEFAULT_HOME_DIR).join(AUTH_FILE),
+            );
+        }
+    }
+
+    if let Ok(default_home) = default_grok_home() {
+        push(
+            &mut candidates,
+            &mut seen,
+            "system_grok_cli",
+            default_home.join(AUTH_FILE),
+        );
+    }
+
+    Ok(candidates)
+}
+
+pub fn import_from_path_with_binding(
+    path: &str,
+) -> Result<Vec<crate::models::grok::GrokAccountView>, String> {
+    let path = PathBuf::from(path.trim());
+    if !file_owner_is_current_user(&path) || !file_permissions_are_private(&path) {
+        return Err("本机 Grok CLI 凭据文件不安全，已拒绝导入".to_string());
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("读取本机 Grok auth.json 失败: {error}"))?;
+    let accounts = import_from_json(&content)?;
+    let value: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
+    if let Ok(parsed) = parse_auth_registry(&value) {
+        let identity = parsed
+            .principal_id
+            .clone()
+            .or(parsed.user_id.clone())
+            .unwrap_or_else(|| parsed.email.clone());
+        let fingerprint = crate::modules::credential_broker::fingerprint_secret(
+            parsed.refresh_token.as_deref().unwrap_or_default(),
+        );
+        if let Some(account) = accounts.first() {
+            let _ = crate::modules::unified_model_gateway::record_shared_session_binding(
+                account.id.clone(),
+                path.display().to_string(),
+                identity,
+                fingerprint,
+            );
+        }
+    }
+    Ok(accounts)
+}
+
+pub fn mirror_shared_session_source(
+    account: &GrokAccount,
+    source_path: &Path,
+    expected_identity: &str,
+    expected_fingerprint: &str,
+) -> Result<bool, String> {
+    if !source_path.exists() {
+        return Ok(false);
+    }
+    if !file_owner_is_current_user(source_path) || !file_permissions_are_private(source_path) {
+        return Err("共享会话源文件权限不安全，已暂停绑定".to_string());
+    }
+    let content = fs::read_to_string(source_path)
+        .map_err(|error| format!("读取共享会话源失败: {error}"))?;
+    let value: Value = serde_json::from_str(&content)
+        .map_err(|error| format!("解析共享会话源失败: {error}"))?;
+    let current = parse_auth_registry(&value)?;
+    let identity = current
+        .principal_id
+        .clone()
+        .or(current.user_id.clone())
+        .unwrap_or_else(|| current.email.clone());
+    if identity != expected_identity {
+        return Err("共享会话源已属于另一个账号，已暂停绑定".to_string());
+    }
+    let current_fp = crate::modules::credential_broker::fingerprint_secret(
+        current.refresh_token.as_deref().unwrap_or_default(),
+    );
+    if current_fp != expected_fingerprint
+        && current
+            .refresh_token
+            .as_deref()
+            .unwrap_or_default()
+            != account.refresh_token.as_deref().unwrap_or_default()
+        && access_still_usable(current.expires_at, now_ts())
+    {
+        // Source was rotated by another process; adopt rather than overwrite.
+        return Ok(false);
+    }
+    write_account_to_profile(account, source_path.parent().unwrap_or(source_path))?;
+    Ok(true)
 }
 
 #[cfg(test)]

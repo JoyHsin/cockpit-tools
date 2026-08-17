@@ -2715,7 +2715,10 @@ fn write_api_provider_to_config_toml_with_options(
     let preserve_codex_router_signed_routing =
         provider_config.mode == CodexApiProviderMode::OpenaiBuiltin
             && normalized.is_none()
-            && has_active_codex_router_signed_routing(base_dir, &doc);
+            && (has_active_codex_router_signed_routing(base_dir, &doc)
+                || crate::modules::unified_model_gateway::is_unified_gateway_signed_routing_active(
+                    base_dir,
+                ));
 
     match provider_config.mode {
         CodexApiProviderMode::OpenaiBuiltin => {

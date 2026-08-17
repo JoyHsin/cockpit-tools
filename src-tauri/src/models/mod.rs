@@ -6,6 +6,7 @@ pub mod codex_local_access;
 pub mod cursor;
 pub mod github_copilot;
 pub mod grok;
+pub mod unified_model_gateway;
 pub mod instance;
 pub mod kiro;
 pub mod qoder;

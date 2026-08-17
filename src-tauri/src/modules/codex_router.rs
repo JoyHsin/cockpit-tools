@@ -594,6 +594,12 @@ pub fn update() -> Result<CodexRouterStatus, String> {
 
 pub fn enable() -> Result<CodexRouterStatus, String> {
     let (codex_home, source_root, _) = require_router_source()?;
+    if crate::modules::unified_model_gateway::assert_not_active_for_other_owner().is_err() {
+        return Err(
+            "统一模型网关正在接管当前 Codex Profile；请先停用统一网关再启用 Codex Router"
+                .to_string(),
+        );
+    }
     if codex_account::is_cockpit_local_access_routing_active(&codex_home) {
         return Err(
             "Cockpit API Service 正在接管当前 Codex Profile；请先停用该服务再启用 Codex Router"

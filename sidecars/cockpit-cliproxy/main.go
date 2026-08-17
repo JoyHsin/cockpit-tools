@@ -99,17 +99,18 @@ type accountModelRule struct {
 }
 
 type manifest struct {
-	APIKeys                    []apiKeySpec        `json:"apiKeys"`
-	Accounts                   []accountSpec       `json:"accounts"`
-	ModelIDs                   []string            `json:"modelIds"`
-	ModelAliases               []modelAliasSpec    `json:"modelAliases"`
-	ExcludedModels             []string            `json:"excludedModels"`
-	AccountModelRules          []accountModelRule  `json:"accountModelRules"`
-	RoutingStrategy            string              `json:"routingStrategy"`
-	CustomRoutingRules         []customRoutingRule `json:"customRoutingRules"`
-	ImmediateSSEResponse       bool                `json:"immediateSseResponse"`
-	MaxConcurrentImageRequests int                 `json:"maxConcurrentImageRequests"`
-	DebugLogs                  *bool               `json:"debugLogs,omitempty"`
+	APIKeys                    []apiKeySpec          `json:"apiKeys"`
+	Accounts                   []accountSpec         `json:"accounts"`
+	ModelIDs                   []string              `json:"modelIds"`
+	ModelAliases               []modelAliasSpec      `json:"modelAliases"`
+	ExcludedModels             []string              `json:"excludedModels"`
+	AccountModelRules          []accountModelRule    `json:"accountModelRules"`
+	RoutingStrategy            string                `json:"routingStrategy"`
+	CustomRoutingRules         []customRoutingRule   `json:"customRoutingRules"`
+	ImmediateSSEResponse       bool                  `json:"immediateSseResponse"`
+	MaxConcurrentImageRequests int                   `json:"maxConcurrentImageRequests"`
+	DebugLogs                  *bool                 `json:"debugLogs,omitempty"`
+	UnifiedGateway             *unifiedGatewayConfig `json:"unifiedGateway,omitempty"`
 
 	apiKeyByValue     map[string]*apiKeySpec
 	accountByID       map[string]*accountSpec
@@ -4343,13 +4344,16 @@ type relayServer struct {
 	policy             *requestPolicy
 	responsesWebsocket gin.HandlerFunc
 	quotaPoolStatePath string
+	grokPool           *grokPoolState
 }
 
 func (s *relayServer) router() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(corsMiddleware())
+	router.Use(s.unifiedGatewayMiddleware())
 	router.Use(s.policy.middleware())
+	router.GET("/healthz", s.handleUnifiedHealthz)
 	router.GET("/v1/models", s.handleModels)
 	router.GET(cockpitQuotaPath, s.handleCockpitQuota)
 	router.POST("/v1/cockpit/auth/reset", s.handleResetAuthState)
@@ -5767,9 +5771,17 @@ func (s *relayServer) requireAPIKey(c *gin.Context) (*apiKeySpec, bool) {
 }
 
 func (s *relayServer) handleExecutorRequest(c *gin.Context, sourceFormat sdktranslator.Format, fixedAlt string) {
-	spec, ok := s.requireAPIKey(c)
-	if !ok {
-		return
+	var spec *apiKeySpec
+	if _, unified := c.Get("unifiedGatewayAuthorized"); unified {
+		if existing, _ := c.Request.Context().Value(clientAPIKeyContextKey).(*apiKeySpec); existing != nil {
+			spec = existing
+		}
+	} else {
+		var ok bool
+		spec, ok = s.requireAPIKey(c)
+		if !ok {
+			return
+		}
 	}
 	body, err := readAndRestoreBody(c.Request)
 	if err != nil {
@@ -5784,6 +5796,9 @@ func (s *relayServer) handleExecutorRequest(c *gin.Context, sourceFormat sdktran
 }
 
 func (s *relayServer) handleExecutorBody(c *gin.Context, spec *apiKeySpec, body []byte, sourceFormat sdktranslator.Format, fixedAlt string) {
+	if s.tryHandleUnifiedRequest(c, body, sourceFormat, fixedAlt) {
+		return
+	}
 	if spec == nil {
 		writeAPIError(c, http.StatusUnauthorized, "missing or invalid API key", "invalid_api_key")
 		return
@@ -8404,6 +8419,18 @@ func main() {
 	if err != nil {
 		emitter.emit(map[string]any{"type": "error", "message": err.Error()})
 		os.Exit(2)
+	}
+	if m.unifiedGatewayEnabled() {
+		if secrets, err := readBrokerHandshake(os.Stdin); err != nil {
+			emitter.emit(map[string]any{"type": "error", "message": "unified gateway handshake failed"})
+			os.Exit(2)
+		} else if client, err := connectBroker(m.UnifiedGateway.BrokerSocket, secrets); err != nil {
+			emitter.emit(map[string]any{"type": "error", "message": "credential broker connect failed"})
+			os.Exit(2)
+		} else {
+			setGlobalBroker(client)
+			defer client.Close()
+		}
 	}
 	emitter.emitStartupStage("init_runtime")
 	quotaState := newQuotaReserveStateStore(*quotaReserveStatePath, m)

@@ -338,6 +338,7 @@ pub fn run() {
 
             tauri::async_runtime::spawn(async {
                 modules::codex_local_access::restore_local_access_gateway().await;
+                modules::unified_model_gateway::restore_on_startup().await;
             });
 
             {
@@ -855,6 +856,16 @@ pub fn run() {
             commands::codex::codex_router_set_provider_key,
             commands::codex::codex_router_remove_provider_key,
             commands::codex::codex_router_run_doctor,
+            commands::codex::unified_gateway_get_state,
+            commands::codex::unified_gateway_enable,
+            commands::codex::unified_gateway_disable,
+            commands::codex::unified_gateway_resolve_conflict,
+            commands::codex::unified_gateway_select_grok_accounts,
+            commands::codex::unified_gateway_import_local_grok,
+            commands::codex::unified_gateway_upsert_api_provider,
+            commands::codex::unified_gateway_set_model_enabled,
+            commands::codex::unified_gateway_set_routing_policy,
+            commands::codex::unified_gateway_migrate_from_router,
             commands::codex::codex_local_access_get_state,
             commands::codex::codex_local_access_save_accounts,
             commands::codex::codex_local_access_append_accounts,
@@ -1315,6 +1326,7 @@ pub fn run() {
                     tauri::async_runtime::spawn(async {
                         modules::codex_local_access::shutdown_local_access_gateway_for_app_exit()
                             .await;
+                        modules::unified_model_gateway::shutdown_for_exit().await;
                     });
                 }
             }
@@ -1323,6 +1335,7 @@ pub fn run() {
                 modules::codex_app_injection::stop_all();
                 tauri::async_runtime::spawn(async {
                     modules::codex_local_access::shutdown_local_access_gateway_for_app_exit().await;
+                    modules::unified_model_gateway::shutdown_for_exit().await;
                 });
             }
             _ => {}

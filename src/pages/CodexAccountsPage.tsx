@@ -184,7 +184,7 @@ import {
   type CodexWakeupTestOpenRequest,
 } from "../components/codex/CodexWakeupContent";
 import { CodexModelProviderManager } from "../components/codex/CodexModelProviderManager";
-import { CodexRouterStatusCard } from "../components/codex/CodexRouterStatusCard";
+import { UnifiedGatewayStatusCard } from "../components/codex/UnifiedGatewayStatusCard";
 import { CodexModelContextWindowTable } from "../components/codex/CodexModelContextWindowTable";
 import {
   contextWindowDraftsFromRecord,
@@ -12669,7 +12669,7 @@ export function CodexAccountsPage() {
     }
 
     if (!activeGroupId && !groupByTag) {
-      cards.push(<CodexRouterStatusCard key="codex-router-status" />);
+      cards.push(<UnifiedGatewayStatusCard key="unified-gateway-status" />);
       cards.push(
         ...codexGroups.map((group) => {
           const groupAccounts = resolveGroupAccounts(group);

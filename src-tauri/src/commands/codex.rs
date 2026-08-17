@@ -14,8 +14,8 @@ use crate::models::codex_local_access::{
 };
 use crate::modules::{
     account, codex_account, codex_local_access, codex_oauth, codex_quota, codex_router,
-    codex_session_visibility, codex_speed, codex_wakeup, codex_wakeup_scheduler, config,
-    hermes_auth, logger, openclaw_auth, opencode_auth, process,
+    unified_model_gateway, codex_session_visibility, codex_speed, codex_wakeup,
+    codex_wakeup_scheduler, config, hermes_auth, logger, openclaw_auth, opencode_auth, process,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -107,6 +107,74 @@ pub fn codex_router_remove_provider_key(
     provider_id: String,
 ) -> Result<Vec<crate::modules::codex_router::CodexRouterProvider>, String> {
     codex_router::remove_provider_key(&provider_id)
+}
+
+#[tauri::command]
+pub async fn unified_gateway_get_state(
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::get_state().await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_enable(
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::enable().await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_disable(
+    force_backup: Option<bool>,
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::disable(force_backup.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_resolve_conflict(
+    restore_backup: bool,
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::resolve_conflict(restore_backup).await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_select_grok_accounts(
+    account_ids: Vec<String>,
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::select_grok_accounts(account_ids).await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_import_local_grok(
+    path: Option<String>,
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::import_local_grok(path).await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_upsert_api_provider(
+    draft: crate::models::unified_model_gateway::UnifiedApiProviderDraft,
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::upsert_api_provider(draft).await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_set_model_enabled(
+    model_id: String,
+    enabled: bool,
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::set_model_enabled(model_id, enabled).await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_set_routing_policy(
+    policy: crate::models::unified_model_gateway::UnifiedRoutingPolicy,
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::set_routing_policy(policy).await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_migrate_from_router(
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::migrate_from_router().await
 }
 
 #[tauri::command]

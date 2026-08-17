@@ -10667,6 +10667,10 @@ fn sidecar_binary_candidates() -> Result<Vec<PathBuf>, String> {
     Ok(candidates)
 }
 
+pub(crate) fn cliproxy_sidecar_binary_path() -> Result<PathBuf, String> {
+    sidecar_binary_path()
+}
+
 fn sidecar_binary_path() -> Result<PathBuf, String> {
     let candidates = sidecar_binary_candidates()?;
     candidates
@@ -21553,6 +21557,7 @@ pub async fn update_local_access_port(port: u16) -> Result<CodexLocalAccessState
 
 pub async fn set_local_access_enabled(enabled: bool) -> Result<CodexLocalAccessState, String> {
     if enabled {
+        crate::modules::unified_model_gateway::assert_not_active_for_other_owner()?;
         advance_gateway_lifecycle_generation();
         ensure_runtime_loaded().await?;
     } else {
