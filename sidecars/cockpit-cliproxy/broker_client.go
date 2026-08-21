@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -27,11 +28,13 @@ type brokerSecrets struct {
 }
 
 type brokerClient struct {
-	conn   net.Conn
-	key    []byte
-	seq    uint64
-	mu     sync.Mutex
-	closed bool
+	socketPath string
+	secrets    *brokerSecrets
+	conn       net.Conn
+	key        []byte
+	seq        uint64
+	mu         sync.Mutex
+	closed     bool
 }
 
 func readBrokerHandshake(r io.Reader) (*brokerSecrets, error) {
@@ -48,9 +51,9 @@ func readBrokerHandshake(r io.Reader) (*brokerSecrets, error) {
 	}, nil
 }
 
-func signBroker(key, payload []byte) string {
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write(payload)
+func signBroker(sessionKey, payload []byte) string {
+	mac := hmac.New(sha256.New, sessionKey)
+	mac.Write(payload)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -58,9 +61,9 @@ func writeBrokerFrame(w io.Writer, payload []byte) error {
 	if len(payload) == 0 || len(payload) > brokerMaxFrame {
 		return fmt.Errorf("invalid broker frame length %d", len(payload))
 	}
-	var header [4]byte
-	binary.LittleEndian.PutUint32(header[:], uint32(len(payload)))
-	if _, err := w.Write(header[:]); err != nil {
+	var length [4]byte
+	binary.LittleEndian.PutUint32(length[:], uint32(len(payload)))
+	if _, err := w.Write(length[:]); err != nil {
 		return err
 	}
 	_, err := w.Write(payload)
@@ -68,11 +71,11 @@ func writeBrokerFrame(w io.Writer, payload []byte) error {
 }
 
 func readBrokerFrame(r io.Reader) ([]byte, error) {
-	var header [4]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
+	var lengthBuf [4]byte
+	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
 		return nil, err
 	}
-	length := binary.LittleEndian.Uint32(header[:])
+	length := int(binary.LittleEndian.Uint32(lengthBuf[:]))
 	if length == 0 || length > brokerMaxFrame {
 		return nil, fmt.Errorf("invalid broker frame length %d", length)
 	}
@@ -95,60 +98,72 @@ func dialBroker(socketPath string) (net.Conn, error) {
 }
 
 func connectBroker(socketPath string, secrets *brokerSecrets) (*brokerClient, error) {
+	client := &brokerClient{
+		socketPath: socketPath,
+		secrets:    secrets,
+		key:        secrets.sessionKey,
+		seq:        1,
+	}
+	if err := client.reconnectLocked(); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func (c *brokerClient) reconnectLocked() error {
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
 	var conn net.Conn
 	var err error
 	for attempt := 0; attempt < 20; attempt++ {
-		conn, err = dialBroker(socketPath)
+		conn, err = dialBroker(c.socketPath)
 		if err == nil {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("dial broker socket: %w", err)
 	}
-	nonceHex := hex.EncodeToString(secrets.nonce)
+	nonceHex := hex.EncodeToString(c.secrets.nonce)
 	pid := os.Getpid()
 	payload := []byte(fmt.Sprintf("hello|%d|%d|%s", brokerProtocol, pid, nonceHex))
 	hello := map[string]any{
 		"protocolVersion": brokerProtocol,
 		"childPid":        pid,
 		"nonce":           nonceHex,
-		"hmac":            signBroker(secrets.sessionKey, payload),
+		"hmac":            signBroker(c.secrets.sessionKey, payload),
 	}
 	raw, err := json.Marshal(hello)
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return err
 	}
 	if err := writeBrokerFrame(conn, raw); err != nil {
 		_ = conn.Close()
-		return nil, err
+		return err
 	}
 	response, err := readBrokerFrame(conn)
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return err
 	}
 	var parsed struct {
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(response, &parsed); err != nil || parsed.Type != "hello_ok" {
 		_ = conn.Close()
-		return nil, fmt.Errorf("broker handshake rejected")
+		return fmt.Errorf("broker handshake rejected")
 	}
-	return &brokerClient{conn: conn, key: secrets.sessionKey, seq: 1}, nil
+	c.conn = conn
+	c.seq = 1
+	c.closed = false
+	return nil
 }
 
-func (c *brokerClient) call(kind, bodyKey, body string, extra map[string]any) (map[string]any, error) {
-	if c == nil {
-		return nil, fmt.Errorf("broker is not connected")
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil, fmt.Errorf("broker connection closed")
-	}
+func (c *brokerClient) sendAndReceiveLocked(kind, bodyKey, body string, extra map[string]any) (map[string]any, error) {
 	seq := c.seq
 	c.seq++
 	payload := []byte(fmt.Sprintf("%d|%s|%s", seq, kind, body))
@@ -203,6 +218,27 @@ func (c *brokerClient) call(kind, bodyKey, body string, extra map[string]any) (m
 	return parsed, nil
 }
 
+func (c *brokerClient) call(kind, bodyKey, body string, extra map[string]any) (map[string]any, error) {
+	if c == nil {
+		return nil, fmt.Errorf("broker is not connected")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.conn == nil {
+		if err := c.reconnectLocked(); err != nil {
+			return nil, fmt.Errorf("broker reconnect: %w", err)
+		}
+	}
+	resp, err := c.sendAndReceiveLocked(kind, bodyKey, body, extra)
+	if err != nil {
+		// 遇到断连错误时，自动尝试重新握手重试一次
+		if recErr := c.reconnectLocked(); recErr == nil {
+			resp, err = c.sendAndReceiveLocked(kind, bodyKey, body, extra)
+		}
+	}
+	return resp, err
+}
+
 func strconvQuote(value string) string {
 	raw, _ := json.Marshal(value)
 	return string(raw)
@@ -242,6 +278,86 @@ func (c *brokerClient) ExecuteProvider(providerID, model string, request json.Ra
 		"modelRoute": model,
 		"request":    payload,
 	})
+}
+
+func (c *brokerClient) ExecuteProviderStream(providerID, model string, request json.RawMessage, onChunk func([]byte) error) (map[string]any, error) {
+	if c == nil {
+		return nil, fmt.Errorf("broker is not connected")
+	}
+	if onChunk == nil {
+		return nil, fmt.Errorf("provider stream callback is required")
+	}
+	var payload any
+	if err := json.Unmarshal(request, &payload); err != nil {
+		payload = map[string]any{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, fmt.Errorf("broker connection closed")
+	}
+	seq := c.seq
+	c.seq++
+	body := providerID + "|" + model
+	req := map[string]any{
+		"type":       "execute_provider_request",
+		"seq":        seq,
+		"providerId": providerID,
+		"modelRoute": model,
+		"request":    payload,
+		"hmac":       signBroker(c.key, []byte(fmt.Sprintf("%d|execute_provider|%s", seq, body))),
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeBrokerFrame(c.conn, raw); err != nil {
+		return nil, err
+	}
+	meta := map[string]any{"type": "provider_response"}
+	for {
+		frame, err := readBrokerFrame(c.conn)
+		if err != nil {
+			return nil, err
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(frame, &parsed); err != nil {
+			return nil, err
+		}
+		typ, _ := parsed["type"].(string)
+		if typ == "error" {
+			message, _ := parsed["message"].(string)
+			code, _ := parsed["code"].(string)
+			if message == "" {
+				message = "broker error"
+			}
+			if code != "" {
+				return parsed, fmt.Errorf("%s: %s", code, message)
+			}
+			return parsed, fmt.Errorf("%s", message)
+		}
+		if typ == "provider_stream_chunk" {
+			data, _ := parsed["data"].(string)
+			chunk, err := base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				return nil, fmt.Errorf("invalid provider stream chunk: %w", err)
+			}
+			if err := onChunk(chunk); err != nil {
+				return nil, err
+			}
+			meta["status"] = parsed["status"]
+			meta["contentType"] = parsed["contentType"]
+			continue
+		}
+		if typ == "provider_stream_done" {
+			meta["status"] = parsed["status"]
+			meta["contentType"] = parsed["contentType"]
+			return meta, nil
+		}
+		if typ == "provider_response" {
+			return parsed, nil
+		}
+	}
 }
 
 func (c *brokerClient) Close() {

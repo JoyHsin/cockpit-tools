@@ -475,6 +475,8 @@ pub struct UnifiedRouterMigrationProvider {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UnifiedApiProviderDraft {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub display_name: String,
     pub provider_type: UnifiedProviderType,
     pub base_url: String,

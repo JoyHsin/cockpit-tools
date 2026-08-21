@@ -43,6 +43,20 @@ export async function upsertUnifiedApiProvider(
   return await invoke("unified_gateway_upsert_api_provider", { draft });
 }
 
+export async function deleteUnifiedApiProvider(
+  providerId: string,
+): Promise<UnifiedGatewayStateView> {
+  return await invoke("unified_gateway_delete_api_provider", { providerId });
+}
+
+export async function testUnifiedApiProvider(
+  baseUrl: string,
+  apiKey: string,
+  wireApi: string,
+): Promise<string[]> {
+  return await invoke("unified_gateway_test_provider", { baseUrl, apiKey, wireApi });
+}
+
 export async function setUnifiedModelEnabled(
   modelId: string,
   enabled: boolean,

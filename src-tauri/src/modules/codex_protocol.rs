@@ -2,6 +2,8 @@ use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
+use crate::models::unified_model_gateway::UnifiedModelCapabilities;
+
 const REASONING_ENCRYPTED_CONTENT_INCLUDE: &str = "reasoning.encrypted_content";
 const CODEX_AUTO_REVIEW_MODEL_ID: &str = "codex-auto-review";
 const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
@@ -13,6 +15,15 @@ const DEFAULT_CONTEXT_WINDOW: i64 = 272_000;
 const DEFAULT_MAX_CONTEXT_WINDOW: i64 = 1_000_000;
 const LOCAL_PROXY_BYPASS_HOSTS: [&str; 5] =
     ["127.0.0.1", "127.0.0.0/8", "localhost", "::1", "::1/128"];
+
+#[derive(Debug, Clone, Default)]
+pub struct UnifiedCodexModelMetadata {
+    pub display_name: String,
+    pub reasoning_efforts: Vec<String>,
+    pub context_window: Option<i64>,
+    pub capabilities: UnifiedModelCapabilities,
+    pub availability: String,
+}
 
 pub fn merge_local_no_proxy(raw: &str) -> String {
     let mut seen = HashSet::new();
@@ -95,6 +106,100 @@ pub fn build_codex_client_models_response_with_model_definitions_and_reasoning(
         })
         .collect::<Vec<_>>();
     json!({ "models": models })
+}
+
+pub fn apply_unified_model_metadata(
+    object: &mut Map<String, Value>,
+    metadata: &UnifiedCodexModelMetadata,
+) {
+    if !metadata.display_name.trim().is_empty() {
+        object.insert(
+            "display_name".to_string(),
+            Value::String(metadata.display_name.clone()),
+        );
+        object.insert(
+            "description".to_string(),
+            Value::String(metadata.display_name.clone()),
+        );
+    }
+
+    let context_window = metadata
+        .context_window
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    object.insert("context_window".to_string(), json!(context_window));
+    object.insert("max_context_window".to_string(), json!(context_window));
+    object.insert(
+        "input_modalities".to_string(),
+        json!(if metadata.capabilities.vision {
+            vec!["text", "image"]
+        } else {
+            vec!["text"]
+        }),
+    );
+    object.insert(
+        "supports_image_detail_original".to_string(),
+        Value::Bool(metadata.capabilities.vision),
+    );
+    object.insert(
+        "supports_parallel_tool_calls".to_string(),
+        Value::Bool(metadata.capabilities.tools),
+    );
+    object.insert(
+        "supported_in_api".to_string(),
+        Value::Bool(metadata.capabilities.text),
+    );
+    if !metadata.availability.trim().is_empty() {
+        object.insert(
+            "availability".to_string(),
+            Value::String(metadata.availability.clone()),
+        );
+    }
+    object.insert("use_responses_lite".to_string(), Value::Bool(false));
+    if metadata.capabilities.search {
+        object.insert(
+            "web_search_tool_type".to_string(),
+            Value::String("text_and_image".to_string()),
+        );
+    } else {
+        object.remove("web_search_tool_type");
+    }
+    if metadata.reasoning_efforts.is_empty() {
+        object.remove("supported_reasoning_levels");
+        object.remove("default_reasoning_level");
+    } else {
+        let existing = object
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let levels = metadata
+            .reasoning_efforts
+            .iter()
+            .map(|effort| {
+                existing
+                    .iter()
+                    .find(|level| {
+                        level.get("effort").and_then(Value::as_str) == Some(effort.as_str())
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| json!({"effort": effort}))
+            })
+            .collect::<Vec<_>>();
+        object.insert("supported_reasoning_levels".to_string(), Value::Array(levels));
+        let current = object
+            .get("default_reasoning_level")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !metadata.reasoning_efforts.iter().any(|effort| effort == current) {
+            if let Some(first) = metadata.reasoning_efforts.first() {
+                object.insert(
+                    "default_reasoning_level".to_string(),
+                    Value::String(first.clone()),
+                );
+            }
+        }
+    }
 }
 
 fn apply_reasoning_effort_override(object: &mut Map<String, Value>, efforts: &[String]) {

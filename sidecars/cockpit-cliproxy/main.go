@@ -3334,10 +3334,10 @@ func (h *authHook) OnResult(ctx context.Context, result coreauth.Result) {
 		requestKind = requestKindFromPath(internallogging.GetEndpoint(ctx))
 	}
 	model := strings.TrimSpace(result.Model)
-	if model == "" {
-		if requestModel, _ := ctx.Value(requestModelContextKey).(string); strings.TrimSpace(requestModel) != "" {
-			model = strings.TrimSpace(requestModel)
-		}
+	if requestModel, _ := ctx.Value(requestModelContextKey).(string); strings.TrimSpace(requestModel) != "" {
+		// Diagnostics are keyed to the client-visible model. Providers may
+		// report an upstream alias after routing, which should not replace it.
+		model = strings.TrimSpace(requestModel)
 	}
 	account := h.accountForAuthID(result.AuthID)
 	status := 0
@@ -4793,6 +4793,10 @@ func (s *relayServer) handleResponses(c *gin.Context) {
 }
 
 func (s *relayServer) handleResponsesWebsocket(c *gin.Context) {
+	if _, unified := c.Get("unifiedGatewayAuthorized"); unified {
+		s.handleOfficialResponsesWebsocket(c)
+		return
+	}
 	spec, ok := s.requireAPIKey(c)
 	if !ok {
 		return
@@ -8495,7 +8499,7 @@ func main() {
 		responsesWebsocket: responsesHandler.ResponsesWebsocket,
 		quotaPoolStatePath: *quotaPoolStatePath,
 	}
-	if err := runRelayHTTPServer(ctx, cfg, relay.router(), emitter); err != nil && !errors.Is(err, context.Canceled) {
+	if err := runRelayHTTPServer(ctx, cfg, wrapUnifiedGatewayHandler(m, relay.router()), emitter); err != nil && !errors.Is(err, context.Canceled) {
 		emitter.emit(map[string]any{"type": "error", "message": err.Error()})
 		os.Exit(1)
 	}

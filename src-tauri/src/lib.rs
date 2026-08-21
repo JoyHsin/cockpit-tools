@@ -914,6 +914,8 @@ pub fn run() {
             commands::codex::unified_gateway_select_grok_accounts,
             commands::codex::unified_gateway_import_local_grok,
             commands::codex::unified_gateway_upsert_api_provider,
+            commands::codex::unified_gateway_delete_api_provider,
+            commands::codex::unified_gateway_test_provider,
             commands::codex::unified_gateway_set_model_enabled,
             commands::codex::unified_gateway_set_routing_policy,
             commands::codex::unified_gateway_migrate_from_router,

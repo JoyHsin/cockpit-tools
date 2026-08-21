@@ -6,6 +6,7 @@
 
 use crate::models::unified_model_gateway::UNIFIED_GATEWAY_PROTOCOL_VERSION;
 use crate::modules::{account, grok_account, local_secret_blob, logger};
+use base64::Engine;
 use rand::RngCore;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
@@ -17,14 +18,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
+use futures_util::StreamExt;
+use url::Url;
 
 const BROKER_SOCKET_NAME: &str = "credential-broker.sock";
 const BROKER_PIPE_PREFIX: &str = "cockpit-ugw-broker-";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(86400 * 365);
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -116,8 +119,7 @@ struct BrokerInner {
     listen_path: PathBuf,
     #[cfg(windows)]
     pipe_name: String,
-    pending_nonce: Option<[u8; 16]>,
-    pending_key: Option<[u8; 32]>,
+    launch_secrets: Option<BrokerLaunchSecrets>,
     pending_child_pid: Option<u32>,
     session: Option<BrokerSession>,
     stop: AtomicBool,
@@ -330,6 +332,44 @@ async fn handle_execute_provider(
     model_route: &str,
     request: &Value,
 ) -> Result<Value, String> {
+    let (url, api_key) = provider_request_target(provider_id)?;
+    let mut body = request.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("model".to_string(), Value::String(model_route.to_string()));
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|error| format!("创建 Provider 客户端失败: {error}"))?;
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Provider 请求失败: {error}"))?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let payload = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取 Provider 响应失败: {error}"))?;
+    Ok(json!({
+        "type": "provider_response",
+        "status": status,
+        "contentType": content_type,
+        "body": String::from_utf8_lossy(&payload),
+    }))
+}
+
+fn provider_request_target(provider_id: &str) -> Result<(String, String), String> {
     let _ = secret_lock(provider_id)?;
     let store = crate::modules::unified_model_gateway::load_store()?;
     let provider = store
@@ -367,29 +407,72 @@ async fn handle_execute_provider(
         .as_deref()
         .unwrap_or("responses")
         .to_ascii_lowercase();
-    let path = if wire.contains("chat") {
-        "/v1/chat/completions"
+    Ok((provider_endpoint_url(base_url, &wire)?, api_key))
+}
+
+fn provider_endpoint_url(base_url: &str, wire_api: &str) -> Result<String, String> {
+    let mut url = Url::parse(base_url.trim())
+        .map_err(|error| format!("Provider Base URL 无效: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Provider Base URL 必须是带主机名的 http(s) 地址".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Provider Base URL 不应包含 query 或 fragment".to_string());
+    }
+    let path = url.path().trim_end_matches('/');
+    let suffix = if wire_api.contains("chat") {
+        "/chat/completions"
     } else {
-        "/v1/responses"
+        "/responses"
     };
-    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let endpoint_path = if path.ends_with("/chat/completions") || path.ends_with("/responses") {
+        path.to_string()
+    } else if path.is_empty() || path == "/" {
+        format!("/v1{suffix}")
+    } else if path.ends_with("/v1") {
+        format!("{path}{suffix}")
+    } else {
+        format!("{path}/v1{suffix}")
+    };
+    url.set_path(&endpoint_path);
+    Ok(url.to_string())
+}
+
+fn provider_request_wants_stream(request: &BrokerRequest) -> bool {
+    let BrokerRequest::ExecuteProviderRequest { request, .. } = request else {
+        return false;
+    };
+    request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+async fn handle_execute_provider_stream<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    provider_id: &str,
+    model_route: &str,
+    request: &Value,
+) -> Result<Value, String> {
+    let (url, api_key) = provider_request_target(provider_id)?;
     let mut body = request.clone();
     if let Some(object) = body.as_object_mut() {
         object.insert("model".to_string(), Value::String(model_route.to_string()));
+        object.insert("stream".to_string(), Value::Bool(true));
     }
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(90))
         .build()
-        .map_err(|error| format!("创建 Provider 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 Provider 流式客户端失败: {error}"))?;
     let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
         .json(&body)
         .send()
         .await
-        .map_err(|error| format!("Provider 请求失败: {error}"))?;
+        .map_err(|error| format!("Provider 流式请求失败: {error}"))?;
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -397,15 +480,25 @@ async fn handle_execute_provider(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    let payload = response
-        .bytes()
-        .await
-        .map_err(|error| format!("读取 Provider 响应失败: {error}"))?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("读取 Provider 流失败: {error}"))?;
+        let data = base64::engine::general_purpose::STANDARD.encode(chunk);
+        write_async_frame(
+            writer,
+            &json!({
+                "type": "provider_stream_chunk",
+                "status": status,
+                "contentType": content_type,
+                "data": data,
+            }),
+        )
+        .await?;
+    }
     Ok(json!({
-        "type": "provider_response",
+        "type": "provider_stream_done",
         "status": status,
         "contentType": content_type,
-        "body": String::from_utf8_lossy(&payload),
     }))
 }
 
@@ -471,6 +564,21 @@ async fn process_request(request: BrokerRequest) -> Value {
                 "message": redact_text(&error),
             }),
         },
+    }
+}
+
+async fn process_request_stream<W: AsyncWrite + Unpin>(
+    request: BrokerRequest,
+    writer: &mut W,
+) -> Result<Value, String> {
+    match request {
+        BrokerRequest::ExecuteProviderRequest {
+            provider_id,
+            model_route,
+            request,
+            ..
+        } => handle_execute_provider_stream(writer, &provider_id, &model_route, &request).await,
+        other => Ok(process_request(other).await),
     }
 }
 
@@ -569,11 +677,9 @@ async fn serve_unix_connection(
         .await;
         return;
     }
-    let Some(expected_nonce) = guard.pending_nonce.take() else {
-        return;
-    };
-    let Some(session_key) = guard.pending_key.take() else {
-        return;
+    let (expected_nonce, session_key) = match &guard.launch_secrets {
+        Some(secrets) => (secrets.nonce, secrets.session_key),
+        None => return,
     };
     let expected_pid = guard.pending_child_pid.filter(|pid| *pid != 0);
     if expected_pid.is_some_and(|pid| pid != hello.child_pid)
@@ -646,7 +752,19 @@ async fn serve_unix_connection(
             session.expected_seq += 1;
             session.last_seen = Instant::now();
         }
-        let response = process_request(request).await;
+        let streaming = provider_request_wants_stream(&request);
+        let response = if streaming {
+            match process_request_stream(request, &mut stream).await {
+                Ok(value) => value,
+                Err(error) => json!({
+                    "type": "error",
+                    "code": "provider_execute_failed",
+                    "message": redact_text(&error),
+                }),
+            }
+        } else {
+            process_request(request).await
+        };
         if write_async_frame(&mut stream, &response).await.is_err() {
             break;
         }
@@ -675,8 +793,8 @@ async fn timeout_read_long(
 }
 
 #[cfg(unix)]
-async fn write_async_frame(
-    stream: &mut tokio::net::UnixStream,
+async fn write_async_frame<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     value: &Value,
 ) -> Result<(), String> {
     let payload = serde_json::to_vec(value).map_err(|error| error.to_string())?;
@@ -768,8 +886,7 @@ pub async fn start_broker(
             .map_err(|error| format!("接管 broker socket 失败: {error}"))?;
         let inner = Arc::new(TokioMutex::new(BrokerInner {
             listen_path: socket_path.clone(),
-            pending_nonce: Some(secrets.nonce),
-            pending_key: Some(secrets.session_key),
+            launch_secrets: Some(secrets.clone()),
             pending_child_pid: Some(child_pid),
             session: None,
             stop: AtomicBool::new(false),
@@ -825,8 +942,7 @@ pub async fn start_broker(
         let inner = Arc::new(TokioMutex::new(BrokerInner {
             listen_path: socket_path.clone(),
             pipe_name: pipe_name.clone(),
-            pending_nonce: Some(secrets.nonce),
-            pending_key: Some(secrets.session_key),
+            launch_secrets: Some(secrets.clone()),
             pending_child_pid: Some(child_pid),
             session: None,
             stop: AtomicBool::new(false),
@@ -893,11 +1009,9 @@ async fn serve_windows_pipe(inner: Arc<TokioMutex<BrokerInner>>) {
             continue;
         };
         let mut guard = inner.lock().await;
-        let Some(expected_nonce) = guard.pending_nonce.take() else {
-            continue;
-        };
-        let Some(session_key) = guard.pending_key.take() else {
-            continue;
+        let (expected_nonce, session_key) = match &guard.launch_secrets {
+            Some(secrets) => (secrets.nonce, secrets.session_key),
+            None => continue,
         };
         let nonce = decode_hex(&hello.nonce).unwrap_or_default();
         if nonce.as_slice() != expected_nonce.as_slice()
@@ -953,7 +1067,19 @@ async fn serve_windows_pipe(inner: Arc<TokioMutex<BrokerInner>>) {
                 session.expected_seq += 1;
                 session.last_seen = Instant::now();
             }
-            let response = process_request(request).await;
+            let streaming = provider_request_wants_stream(&request);
+            let response = if streaming {
+                match process_request_stream(request, &mut stream).await {
+                    Ok(value) => value,
+                    Err(error) => json!({
+                        "type": "error",
+                        "code": "provider_execute_failed",
+                        "message": redact_text(&error),
+                    }),
+                }
+            } else {
+                process_request(request).await
+            };
             let payload = serde_json::to_vec(&response).unwrap_or_default();
             if stream
                 .write_all(&(payload.len() as u32).to_le_bytes())
@@ -979,8 +1105,7 @@ pub async fn stop_broker() {
         let mut guard = inner.lock().await;
         guard.stop.store(true, Ordering::SeqCst);
         guard.session = None;
-        guard.pending_key = None;
-        guard.pending_nonce = None;
+        guard.launch_secrets = None;
         let path = guard.listen_path.clone();
         drop(guard);
         let _ = std::fs::remove_file(path);
@@ -1079,5 +1204,22 @@ mod tests {
     fn frame_round_trip() {
         let framed = write_frame_for_tests(b"{\"ok\":true}").unwrap();
         assert_eq!(read_frame_for_tests(&framed).unwrap(), b"{\"ok\":true}");
+    }
+
+    #[test]
+    fn provider_endpoint_normalizes_common_base_url_shapes() {
+        assert_eq!(
+            provider_endpoint_url("https://api.deepseek.com", "chat_completions").unwrap(),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            provider_endpoint_url("https://api.deepseek.com/v1/", "chat_completions").unwrap(),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            provider_endpoint_url("https://gateway.example/v1/responses", "responses").unwrap(),
+            "https://gateway.example/v1/responses"
+        );
+        assert!(provider_endpoint_url("file:///tmp/provider", "responses").is_err());
     }
 }

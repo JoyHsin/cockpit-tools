@@ -24,12 +24,13 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::Mutex as TokioMutex;
 use toml_edit::{value, Document};
+use url::Url;
 
 const STORE_FILE: &str = "unified_model_gateway.json";
 const BACKUP_DIR: &str = "unified_gateway_backups";
@@ -37,6 +38,12 @@ const SIDECAR_DIR: &str = "unified_gateway_sidecar";
 const OFFICIAL_PROVIDER_ID: &str = "official-codex";
 const GROK_OAUTH_PROVIDER_ID: &str = "grok-oauth";
 const XAI_API_PROVIDER_ID: &str = "xai-api";
+// This provider deliberately keeps Codex's ChatGPT authentication while
+// disabling the Responses WebSocket transport. The latter cannot inspect the
+// selected model until after the connection is upgraded, so it cannot safely
+// choose an external provider.
+const UNIFIED_GATEWAY_CODEX_PROVIDER_ID: &str = "cockpit-unified-gateway";
+const UNIFIED_GATEWAY_CODEX_PROVIDER_NAME: &str = "Cockpit Unified Gateway (ChatGPT auth)";
 const DEFAULT_PORT: u16 = 1457;
 const QUOTA_TTL_MS: i64 = 10 * 60 * 1000;
 const SUPPORTED_CODEX_RANGE: &str = "verified-codex-app-cli-first-release";
@@ -103,7 +110,7 @@ fn default_grok_models() -> Vec<UnifiedModel> {
     ["grok-4.5", "grok-4.6"]
         .into_iter()
         .map(|id| UnifiedModel {
-            id: id.to_string(),
+            id: format!("{GROK_OAUTH_PROVIDER_ID}/{id}"),
             display_name: if id == "grok-4.5" {
                 "Grok 4.5 (OAuth)".to_string()
             } else {
@@ -227,7 +234,7 @@ fn migrate_store(mut store: UnifiedGatewayStore) -> UnifiedGatewayStore {
         if official_ids.contains(&model.id) && model.provider_id == OFFICIAL_PROVIDER_ID {
             continue;
         }
-        next_models.push(namespaced_if_conflict(model, &official_ids));
+        next_models.push(namespaced_model(model, &official_ids));
     }
     if !next_models
         .iter()
@@ -243,9 +250,20 @@ fn migrate_store(mut store: UnifiedGatewayStore) -> UnifiedGatewayStore {
     store
 }
 
-fn namespaced_if_conflict(mut model: UnifiedModel, official_ids: &HashSet<String>) -> UnifiedModel {
-    if official_ids.contains(&model.id) && model.provider_id != OFFICIAL_PROVIDER_ID {
-        model.id = format!("cockpit.{}", model.upstream_model);
+fn namespaced_model(mut model: UnifiedModel, official_ids: &HashSet<String>) -> UnifiedModel {
+    if model.provider_id != OFFICIAL_PROVIDER_ID {
+        let provider_prefix = format!("{}/", model.provider_id.trim());
+        let upstream = if model.upstream_model.trim().is_empty() {
+            model.id.trim().to_string()
+        } else {
+            model.upstream_model.trim().to_string()
+        };
+        if !model.id.starts_with(&provider_prefix) {
+            model.id = format!("{provider_prefix}{upstream}");
+        }
+        if official_ids.contains(&model.id) {
+            model.id = format!("{provider_prefix}{upstream}");
+        }
     }
     model
 }
@@ -427,17 +445,17 @@ fn ownership_matches(profile: &Path, doc: &Document) -> Result<bool, String> {
         .and_then(|item| item.as_str())
         .unwrap_or_default();
     let expected = capability_base_url(&store);
-    Ok(configured == expected && state.managed_base_url == expected)
-}
-
-fn hash_config_file(profile: &Path) -> Result<String, String> {
-    let path = config_path(profile);
-    if !path.exists() {
-        return Ok(sha256_hex(""));
+    if state.ownership_id != store.ownership_id || state.managed_base_url != expected {
+        return Ok(false);
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|error| format!("读取 config.toml 失败: {error}"))?;
-    Ok(sha256_hex(&content))
+    if state.mode == "root-openai" && state.managed_provider == "openai" {
+        // Compatibility with the first Unified Gateway release. Startup
+        // upgrades this shape before a new Codex process is launched.
+        return Ok(configured == expected);
+    }
+    Ok(unified_gateway_provider_matches(doc, &expected)
+        && state.mode == "custom-provider"
+        && state.managed_provider == UNIFIED_GATEWAY_CODEX_PROVIDER_ID)
 }
 
 fn hash_managed_fields(doc: &Document) -> String {
@@ -449,7 +467,63 @@ fn hash_managed_fields(doc: &Document) -> String {
         .get("model_catalog_json")
         .and_then(|item| item.as_str())
         .unwrap_or_default();
-    sha256_hex(&format!("{base}|{catalog}"))
+    let provider = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let provider_table = doc
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(UNIFIED_GATEWAY_CODEX_PROVIDER_ID))
+        .and_then(|item| item.as_table());
+    let provider_base = provider_table
+        .and_then(|table| table.get("base_url"))
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let wire_api = provider_table
+        .and_then(|table| table.get("wire_api"))
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let requires_openai_auth = provider_table
+        .and_then(|table| table.get("requires_openai_auth"))
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    let supports_websockets = provider_table
+        .and_then(|table| table.get("supports_websockets"))
+        .and_then(|item| item.as_bool())
+        .unwrap_or(true);
+    sha256_hex(&format!(
+        "{base}|{catalog}|{provider}|{provider_base}|{wire_api}|{requires_openai_auth}|{supports_websockets}"
+    ))
+}
+
+fn unified_gateway_provider_matches(doc: &Document, expected_base_url: &str) -> bool {
+    if doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        != Some(UNIFIED_GATEWAY_CODEX_PROVIDER_ID)
+    {
+        return false;
+    }
+    let Some(table) = doc
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(UNIFIED_GATEWAY_CODEX_PROVIDER_ID))
+        .and_then(|item| item.as_table())
+    else {
+        return false;
+    };
+    table.get("base_url").and_then(|item| item.as_str()) == Some(expected_base_url)
+        && table.get("wire_api").and_then(|item| item.as_str()) == Some("responses")
+        && table
+            .get("requires_openai_auth")
+            .and_then(|item| item.as_bool())
+            == Some(true)
+        && table
+            .get("supports_websockets")
+            .and_then(|item| item.as_bool())
+            == Some(false)
 }
 
 fn push_event(level: &str, code: &str, message: &str) {
@@ -528,12 +602,58 @@ fn build_catalog_json(store: &UnifiedGatewayStore) -> Result<String, String> {
         .filter(|model| model.enabled && model.provider_id != OFFICIAL_PROVIDER_ID)
         .map(|model| (model.id.clone(), model.display_name.clone()))
         .collect::<Vec<_>>();
-    let response = codex_protocol::build_codex_client_models_response_with_custom_models(
-        &official_ids,
-        &custom,
-    );
+    let mut models = Vec::new();
+    if !official_ids.is_empty() {
+        let official = codex_protocol::build_codex_client_models_response(&official_ids);
+        if let Some(list) = official.get("models").and_then(Value::as_array) {
+            models.extend(list.clone());
+        }
+    }
+    if !custom.is_empty() {
+        let custom_response =
+            codex_protocol::build_codex_client_models_response_with_model_definitions(&custom);
+        if let Some(list) = custom_response.get("models").and_then(Value::as_array) {
+            models.extend(list.clone());
+        }
+    }
+    let custom_by_id = store
+        .models
+        .iter()
+        .filter(|model| model.enabled && model.provider_id != OFFICIAL_PROVIDER_ID)
+        .map(|model| {
+            (
+                model.id.as_str(),
+                codex_protocol::UnifiedCodexModelMetadata {
+                    display_name: model.display_name.clone(),
+                    reasoning_efforts: model.reasoning_efforts.clone(),
+                    context_window: model.context_window,
+                    capabilities: model.capabilities.clone(),
+                    availability: model.availability.clone(),
+                },
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let official: HashSet<_> = official_ids.into_iter().collect();
+    for model in &mut models {
+        let Some(object) = model.as_object_mut() else {
+            continue;
+        };
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("slug").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        if let Some(metadata) = custom_by_id.get(id.as_str()) {
+            codex_protocol::apply_unified_model_metadata(object, metadata);
+        }
+        object.insert(
+            "prefer_websockets".to_string(),
+            Value::Bool(official.contains(&id)),
+        );
+    }
     let catalog = json!({
-        "models": response.get("models").cloned().unwrap_or(json!([])),
+        "models": models,
     });
     serde_json::to_string_pretty(&catalog).map_err(|error| format!("生成模型目录失败: {error}"))
 }
@@ -551,13 +671,20 @@ fn backup_profile(profile: &Path, store: &mut UnifiedGatewayStore) -> Result<(),
     let dest = backup_root()?.join(&backup_id);
     std::fs::create_dir_all(&dest).map_err(|error| format!("创建备份目录失败: {error}"))?;
     let config = config_path(profile);
-    if config.exists() {
-        std::fs::copy(&config, dest.join("config.toml"))
+    let backup_content = if config.exists() {
+        let existing = std::fs::read_to_string(&config)
+            .map_err(|error| format!("读取 config.toml 失败: {error}"))?;
+        stripped_config_content(&existing)?
+    } else {
+        String::new()
+    };
+    if !backup_content.is_empty() {
+        std::fs::write(dest.join("config.toml"), &backup_content)
             .map_err(|error| format!("备份 config.toml 失败: {error}"))?;
     }
     store.backup = Some(UnifiedGatewayBackupRef {
         backup_id,
-        original_config_hash: hash_config_file(profile)?,
+        original_config_hash: sha256_hex(&backup_content),
         managed_config_hash: String::new(),
         created_at: now_ms(),
         profile_dir: profile.display().to_string(),
@@ -579,24 +706,42 @@ fn apply_managed_config(profile: &Path, store: &UnifiedGatewayStore) -> Result<S
         .and_then(|item| item.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if provider.is_some_and(|value| value != "openai") {
+    if provider.is_some_and(|value| value != "openai" && value != UNIFIED_GATEWAY_CODEX_PROVIDER_ID)
+    {
         return Err(
             "当前 Codex Profile 使用了自定义 Provider，统一网关不会覆盖该配置。".to_string(),
         );
     }
-    doc["openai_base_url"] = value(capability_base_url(store));
-    doc["model_catalog_json"] = value(UNIFIED_GATEWAY_MODEL_CATALOG_FILE);
+    // A root `openai_base_url` leaves the built-in OpenAI provider's
+    // WebSocket capability enabled. Codex then connects before it knows the
+    // target model, and the relay can only forward it to ChatGPT. Use a
+    // dedicated provider instead so the client keeps ChatGPT auth but always
+    // uses the HTTP/SSE transport where routing is model-aware.
+    let _ = doc.remove("openai_base_url");
+    doc["model_provider"] = value(UNIFIED_GATEWAY_CODEX_PROVIDER_ID);
     if doc.get("model_providers").is_none() {
         doc["model_providers"] = toml_edit::table();
     }
-    if let Some(providers) = doc["model_providers"].as_table_mut() {
-        if !providers.contains_key("openai") {
-            providers["openai"] = toml_edit::table();
-        }
-        if let Some(openai) = providers["openai"].as_table_mut() {
-            openai["requires_openai_auth"] = value(true);
-        }
+    let providers = doc["model_providers"]
+        .as_table_mut()
+        .ok_or("config.toml 中 model_providers 不是合法表结构")?;
+    if !providers.contains_key(UNIFIED_GATEWAY_CODEX_PROVIDER_ID) {
+        providers[UNIFIED_GATEWAY_CODEX_PROVIDER_ID] = toml_edit::table();
     }
+    let provider_table = providers[UNIFIED_GATEWAY_CODEX_PROVIDER_ID]
+        .as_table_mut()
+        .ok_or("config.toml 中统一网关 provider 不是合法表结构")?;
+    provider_table["name"] = value(UNIFIED_GATEWAY_CODEX_PROVIDER_NAME);
+    provider_table["base_url"] = value(capability_base_url(store));
+    provider_table["wire_api"] = value("responses");
+    provider_table["requires_openai_auth"] = value(true);
+    provider_table["supports_websockets"] = value(false);
+    // Newer Codex requires an absolute path here; a bare filename fails with
+    // "AbsolutePathBuf deserialized without a base path".
+    doc["model_catalog_json"] = value(catalog_path(profile).to_string_lossy().to_string());
+    // Built-in `openai` already sends official auth. Overriding
+    // `[model_providers.openai]` is rejected as a reserved provider ID.
+    remove_reserved_openai_provider_override(&mut doc);
     let content = codex_config_format::codex_config_doc_to_string(&mut doc);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建 Codex 目录失败: {error}"))?;
@@ -619,10 +764,10 @@ fn write_profile_state(
     let state = UnifiedGatewayProfileState {
         version: 1,
         ownership_id: store.ownership_id.clone(),
-        mode: "root-openai".to_string(),
-        managed_provider: "openai".to_string(),
+        mode: "custom-provider".to_string(),
+        managed_provider: UNIFIED_GATEWAY_CODEX_PROVIDER_ID.to_string(),
         managed_base_url: capability_base_url(store),
-        catalog_file: UNIFIED_GATEWAY_MODEL_CATALOG_FILE.to_string(),
+        catalog_file: catalog_path(profile).to_string_lossy().to_string(),
         original_config_hash: store
             .backup
             .as_ref()
@@ -649,6 +794,95 @@ fn write_profile_state(
 fn remove_managed_fields(doc: &mut Document) {
     for key in MANAGED_KEYS {
         let _ = doc.remove(key);
+    }
+    let remove_root_provider = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        == Some(UNIFIED_GATEWAY_CODEX_PROVIDER_ID);
+    if remove_root_provider {
+        let _ = doc.remove("model_provider");
+    }
+    let remove_root_base_url = doc
+        .get("openai_base_url")
+        .and_then(|item| item.as_str())
+        .is_some_and(|value| value.contains(UNIFIED_GATEWAY_ENDPOINT_MARKER));
+    if remove_root_base_url {
+        let _ = doc.remove("openai_base_url");
+    }
+    remove_unified_gateway_provider_override(doc);
+    remove_reserved_openai_provider_override(doc);
+}
+
+fn config_has_managed_fields(doc: &Document) -> bool {
+    MANAGED_KEYS.iter().any(|key| doc.get(key).is_some())
+        || doc
+            .get("openai_base_url")
+            .and_then(|item| item.as_str())
+            .is_some_and(|value| value.contains(UNIFIED_GATEWAY_ENDPOINT_MARKER))
+        || doc
+            .get("model_provider")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            == Some(UNIFIED_GATEWAY_CODEX_PROVIDER_ID)
+        || doc
+            .get("model_providers")
+            .and_then(|item| item.get("openai"))
+            .is_some()
+        || doc
+            .get("model_providers")
+            .and_then(|item| item.get(UNIFIED_GATEWAY_CODEX_PROVIDER_ID))
+            .is_some()
+}
+
+fn stripped_config_content(existing: &str) -> Result<String, String> {
+    if existing.trim().is_empty() {
+        return Ok(existing.to_string());
+    }
+    let mut doc = codex_config_format::read_codex_config_doc_from_str(existing)
+        .map_err(|error| format!("解析 config.toml 失败: {error}"))?;
+    if !config_has_managed_fields(&doc) {
+        return Ok(existing.to_string());
+    }
+    remove_managed_fields(&mut doc);
+    Ok(codex_config_format::codex_config_doc_to_string(&mut doc))
+}
+
+fn strip_managed_fields_from_config(profile: &Path) -> Result<(), String> {
+    let path = config_path(profile);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let content = stripped_config_content(&existing)?;
+    if content == existing {
+        return Ok(());
+    }
+    codex_config_format::write_codex_config_toml_atomic(&path, &content)
+        .map_err(|error| format!("移除网关字段失败: {error}"))?;
+    Ok(())
+}
+
+fn remove_reserved_openai_provider_override(doc: &mut Document) {
+    let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_mut())
+    else {
+        return;
+    };
+    let _ = providers.remove("openai");
+    if providers.is_empty() {
+        let _ = doc.remove("model_providers");
+    }
+}
+
+fn remove_unified_gateway_provider_override(doc: &mut Document) {
+    let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_mut())
+    else {
+        return;
+    };
+    let _ = providers.remove(UNIFIED_GATEWAY_CODEX_PROVIDER_ID);
+    if providers.is_empty() {
+        let _ = doc.remove("model_providers");
     }
 }
 
@@ -695,18 +929,16 @@ fn restore_official_mode(
                 codex_config_format::write_codex_config_toml_atomic(&path, &content)
                     .map_err(|error| format!("移除网关字段失败: {error}"))?;
             }
-        } else if !existing.trim().is_empty() {
-            let mut doc = codex_config_format::read_codex_config_doc_from_str(&existing)
-                .map_err(|error| format!("解析 config.toml 失败: {error}"))?;
-            remove_managed_fields(&mut doc);
-            let content = codex_config_format::codex_config_doc_to_string(&mut doc);
-            codex_config_format::write_codex_config_toml_atomic(&path, &content)
-                .map_err(|error| format!("移除网关字段失败: {error}"))?;
         }
     } else {
         return Err("CONFIG_CONFLICT".to_string());
     }
 
+    // Always strip gateway keys after restore. Backups taken while the gateway
+    // was already managing config.toml can still contain model_catalog_json;
+    // deleting the catalog file without removing that key makes Codex fail with
+    // "failed to resolve feature override precedence: No such file or directory".
+    strip_managed_fields_from_config(profile)?;
     let _ = std::fs::remove_file(profile_state_path(profile));
     let _ = std::fs::remove_file(catalog_path(profile));
     let _ = codex_local_access::invalidate_codex_model_cache(profile);
@@ -730,6 +962,11 @@ fn user_only_has_managed_fields(existing: &str) -> bool {
     doc.get("openai_base_url")
         .and_then(|item| item.as_str())
         .is_some_and(|value| value.contains(UNIFIED_GATEWAY_ENDPOINT_MARKER))
+        || doc
+            .get("model_provider")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            == Some(UNIFIED_GATEWAY_CODEX_PROVIDER_ID)
 }
 
 fn inspect_conflict(profile: &Path, store: &UnifiedGatewayStore) -> UnifiedGatewayConflict {
@@ -909,7 +1146,8 @@ fn status_from(store: &UnifiedGatewayStore, running: bool) -> UnifiedGatewayStat
             "none".to_string()
         },
         conflict: store.lifecycle == UnifiedGatewayLifecycle::RecoveryRequired,
-        router_detected: router_preview().router_installed,
+        router_detected: router_preview().router_installed
+            && store.lifecycle != UnifiedGatewayLifecycle::Active,
         api_service_active: local_access_enabled(),
         supported_codex_range: SUPPORTED_CODEX_RANGE.to_string(),
         threat_model_note: THREAT_MODEL_NOTE.to_string(),
@@ -922,6 +1160,7 @@ fn diagnostics_from(
 ) -> UnifiedGatewayDiagnostics {
     let profile = profile_dir();
     let existing = std::fs::read_to_string(config_path(&profile)).unwrap_or_default();
+    let broker_listening = credential_broker::is_broker_configured();
     UnifiedGatewayDiagnostics {
         lifecycle: store.lifecycle,
         running: runtime.running,
@@ -941,7 +1180,7 @@ fn diagnostics_from(
             .backup
             .as_ref()
             .map(|item| item.original_config_hash.clone()),
-        broker_listening: credential_broker::is_broker_configured(),
+        broker_listening,
         sidecar_running: runtime.running,
         last_error: store.last_error.clone(),
         last_error_code: store.last_error_code.clone(),
@@ -949,17 +1188,78 @@ fn diagnostics_from(
         provider_health: store
             .providers
             .iter()
-            .map(|provider| UnifiedProviderHealth {
-                provider_id: provider.id.clone(),
-                display_name: provider.display_name.clone(),
-                healthy: provider.enabled,
-                detail: if provider.enabled {
-                    "enabled".to_string()
-                } else {
-                    "disabled".to_string()
-                },
-            })
+            .map(|provider| provider_health(store, provider, runtime.running, broker_listening))
             .collect(),
+    }
+}
+
+fn provider_health(
+    store: &UnifiedGatewayStore,
+    provider: &UnifiedModelProvider,
+    sidecar_running: bool,
+    broker_listening: bool,
+) -> UnifiedProviderHealth {
+    let mut healthy = provider.enabled && sidecar_running;
+    let mut detail = if !provider.enabled {
+        "disabled".to_string()
+    } else if !sidecar_running {
+        "sidecar_not_running".to_string()
+    } else {
+        "ready".to_string()
+    };
+    match provider.provider_type {
+        UnifiedProviderType::OfficialCodex => {
+            if healthy && !auth_json_untouched(&profile_dir()) {
+                healthy = false;
+                detail = "official_auth_missing".to_string();
+            }
+        }
+        UnifiedProviderType::GrokOauth => {
+            let has_credential = store.credential_refs.iter().any(|item| {
+                item.enabled
+                    && item.kind == UnifiedCredentialKind::GrokOauth
+                    && item.account_id.is_some()
+                    && provider.credential_ref_ids.iter().any(|id| id == &item.id)
+            });
+            if healthy && !broker_listening {
+                healthy = false;
+                detail = "credential_broker_not_running".to_string();
+            } else if healthy && !has_credential {
+                healthy = false;
+                detail = "grok_oauth_account_missing".to_string();
+            }
+        }
+        UnifiedProviderType::XaiApi | UnifiedProviderType::OpenaiCompatible => {
+            let has_credential = store.credential_refs.iter().any(|item| {
+                item.enabled
+                    && item.kind == UnifiedCredentialKind::ApiKey
+                    && item.secret_id.is_some()
+                    && provider.credential_ref_ids.iter().any(|id| id == &item.id)
+            });
+            if healthy && !broker_listening {
+                healthy = false;
+                detail = "credential_broker_not_running".to_string();
+            } else if healthy
+                && provider
+                    .base_url
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                healthy = false;
+                detail = "base_url_missing".to_string();
+            } else if healthy && !has_credential {
+                healthy = false;
+                detail = "api_key_missing".to_string();
+            }
+        }
+    }
+    UnifiedProviderHealth {
+        provider_id: provider.id.clone(),
+        display_name: provider.display_name.clone(),
+        healthy,
+        detail,
     }
 }
 
@@ -1029,16 +1329,17 @@ async fn enable_inner(store: &mut UnifiedGatewayStore) -> Result<(), String> {
     backup_profile(&profile, store)?;
     write_catalog(&profile, store)?;
     store.lifecycle = UnifiedGatewayLifecycle::Configured;
+    save_store(store)?;
+
+    store.lifecycle = UnifiedGatewayLifecycle::Verifying;
+    save_store(store)?;
+    start_runtime(store).await?;
     let managed_hash = apply_managed_config(&profile, store)?;
     if let Some(backup) = store.backup.as_mut() {
         backup.managed_config_hash = managed_hash.clone();
     }
     write_profile_state(&profile, store, &managed_hash)?;
     save_store(store)?;
-
-    store.lifecycle = UnifiedGatewayLifecycle::Verifying;
-    save_store(store)?;
-    start_runtime(store).await?;
     verify_models_endpoint(store).await?;
     store.lifecycle = UnifiedGatewayLifecycle::Active;
     store.updated_at = now_ms();
@@ -1176,23 +1477,45 @@ pub async fn import_local_grok(path: Option<String>) -> Result<UnifiedGatewaySta
 pub async fn upsert_api_provider(
     draft: UnifiedApiProviderDraft,
 ) -> Result<UnifiedGatewayStateView, String> {
-    if draft.api_key.trim().is_empty() {
-        return Err("请重新确认 API Key，统一网关不会从旧 Router 读取密钥。".to_string());
+    if draft.display_name.trim().is_empty() {
+        return Err("Provider 显示名称不能为空".to_string());
     }
+    let wire_api = normalize_provider_wire_api(draft.wire_api.as_deref());
+    let base_url = normalize_provider_base_url(&draft.base_url)?;
     let mut store = load_store()?;
-    let provider_id = if draft.provider_type == UnifiedProviderType::XaiApi {
-        XAI_API_PROVIDER_ID.to_string()
-    } else {
-        format!("openai-compat-{}", random_token(8).to_ascii_lowercase())
-    };
-    let secret_id = format!("secret_{}", random_token(12));
-    credential_broker::write_api_key_secret(&secret_id, draft.api_key.trim())?;
+    let provider_id = draft
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if draft.provider_type == UnifiedProviderType::XaiApi {
+                XAI_API_PROVIDER_ID.to_string()
+            } else {
+                stable_provider_id(&draft.display_name, &draft.base_url)
+            }
+        });
     let cred_id = format!("cred-{provider_id}");
+    let previous_secret_id = store
+        .credential_refs
+        .iter()
+        .find(|item| item.id == cred_id)
+        .and_then(|item| item.secret_id.clone());
+    let secret_id = if draft.api_key.trim().is_empty() {
+        previous_secret_id
+            .clone()
+            .ok_or_else(|| "请填写 API Key，统一网关不会从旧 Router 读取密钥。".to_string())?
+    } else {
+        let secret_id = format!("secret_{}", random_token(12));
+        credential_broker::write_api_key_secret(&secret_id, draft.api_key.trim())?;
+        secret_id
+    };
     store.credential_refs.retain(|item| item.id != cred_id);
     store.credential_refs.push(UnifiedCredentialRef {
         id: cred_id.clone(),
         kind: UnifiedCredentialKind::ApiKey,
-        secret_id: Some(secret_id),
+        secret_id: Some(secret_id.clone()),
         enabled: true,
         label: Some(draft.display_name.clone()),
         ..UnifiedCredentialRef::default()
@@ -1204,10 +1527,8 @@ pub async fn upsert_api_provider(
         display_name: draft.display_name,
         enabled: true,
         credential_ref_ids: vec![cred_id],
-        base_url: Some(draft.base_url.trim_end_matches('/').to_string()),
-        wire_api: draft
-            .wire_api
-            .or_else(|| Some("chat_completions".to_string())),
+        base_url: Some(base_url),
+        wire_api: Some(wire_api),
         ..UnifiedModelProvider::default()
     });
     let official = official_models()
@@ -1222,27 +1543,243 @@ pub async fn upsert_api_provider(
         if trimmed.is_empty() {
             continue;
         }
-        store.models.push(namespaced_if_conflict(
+        store.models.push(namespaced_model(
             UnifiedModel {
-                id: trimmed.to_string(),
+                id: format!("{provider_id}/{trimmed}"),
                 display_name: trimmed.to_string(),
                 provider_id: provider_id.clone(),
                 upstream_model: trimmed.to_string(),
                 route: provider_id.clone(),
                 enabled: true,
-                capabilities: UnifiedModelCapabilities::default(),
-                ..UnifiedModel::default()
+                capabilities: infer_model_capabilities(trimmed),
+                context_window: infer_context_window(trimmed),
+                reasoning_efforts: infer_reasoning_efforts(trimmed),
+                availability: "available".to_string(),
             },
             &official,
         ));
     }
     store.updated_at = now_ms();
     save_store(&store)?;
+    if let Some(previous_secret_id) = previous_secret_id {
+        if previous_secret_id != secret_id
+            && !store
+                .credential_refs
+                .iter()
+                .any(|item| item.secret_id.as_deref() == Some(previous_secret_id.as_str()))
+        {
+            let _ = credential_broker::delete_api_key_secret(&previous_secret_id);
+        }
+    }
     if store.lifecycle == UnifiedGatewayLifecycle::Active {
         write_catalog(&profile_dir(), &store)?;
         start_runtime(&store).await?;
     }
     get_state().await
+}
+
+fn infer_model_capabilities(model_id: &str) -> UnifiedModelCapabilities {
+    let lower = model_id.to_ascii_lowercase();
+    let is_vision = lower.contains("vision")
+        || lower.contains("vl")
+        || lower.contains("omni")
+        || lower.contains("4o")
+        || lower.contains("claude-3")
+        || lower.contains("gemini")
+        || lower.contains("mimo-v2.5");
+    UnifiedModelCapabilities {
+        text: true,
+        streaming: true,
+        tools: true, // 核心：默认开启工具调用
+        vision: is_vision,
+        search: false,
+    }
+}
+
+fn infer_context_window(model_id: &str) -> Option<i64> {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.contains("1m") || lower.contains("1000k") || lower.contains("kimi-k3") {
+        Some(1_000_000)
+    } else if lower.contains("256k") {
+        Some(262_144)
+    } else if lower.contains("200k") || lower.contains("claude") {
+        Some(200_000)
+    } else if lower.contains("128k")
+        || lower.contains("deepseek")
+        || lower.contains("qwen")
+        || lower.contains("glm")
+    {
+        Some(131_072)
+    } else if lower.contains("32k") {
+        Some(32_768)
+    } else {
+        Some(131_072)
+    }
+}
+
+fn infer_reasoning_efforts(model_id: &str) -> Vec<String> {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.contains("reasoner")
+        || lower.contains("r1")
+        || lower.contains("o1")
+        || lower.contains("o3")
+        || lower.contains("thinking")
+        || lower.contains("grok")
+    {
+        vec!["low".to_string(), "medium".to_string(), "high".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+pub async fn test_api_provider(
+    base_url: String,
+    api_key: String,
+    wire_api: String,
+) -> Result<Vec<String>, String> {
+    let base_url = normalize_provider_base_url(&base_url)?;
+    let _ = normalize_provider_wire_api(Some(&wire_api));
+    let mut url = Url::parse(&base_url).map_err(|error| format!("Base URL 无效: {error}"))?;
+    let path = url.path().trim_end_matches('/');
+    let endpoint = if path.is_empty() || path == "/" {
+        "/v1/models".to_string()
+    } else if path.ends_with("/v1") {
+        format!("{path}/models")
+    } else {
+        format!("{path}/v1/models")
+    };
+    url.set_path(&endpoint);
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))?;
+
+    let mut req = client.get(url.as_str());
+    if !api_key.trim().is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key.trim()));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|error| format!("连接 Provider 失败: {error}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Provider 返回 HTTP {status}: {body}"));
+    }
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|error| format!("解析模型列表响应失败: {error}"))?;
+    let mut model_ids = Vec::new();
+    if let Some(data) = body.get("data").and_then(Value::as_array) {
+        for item in data {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                model_ids.push(id.to_string());
+            }
+        }
+    } else if let Some(models) = body.get("models").and_then(Value::as_array) {
+        for item in models {
+            if let Some(id) = item
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("name").and_then(Value::as_str))
+            {
+                model_ids.push(id.to_string());
+            }
+        }
+    }
+    model_ids.sort();
+    model_ids.dedup();
+    Ok(model_ids)
+}
+
+fn normalize_provider_wire_api(value: Option<&str>) -> String {
+    if value
+        .map(|value| value.to_ascii_lowercase().contains("chat"))
+        .unwrap_or(false)
+    {
+        "chat_completions".to_string()
+    } else {
+        "responses".to_string()
+    }
+}
+
+fn normalize_provider_base_url(value: &str) -> Result<String, String> {
+    let value = value.trim().trim_end_matches('/');
+    let url = Url::parse(value).map_err(|error| format!("Base URL 无效: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Base URL 必须是带主机名的 http(s) 地址".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Base URL 不应包含 query 或 fragment".to_string());
+    }
+    Ok(value.to_string())
+}
+
+pub async fn delete_api_provider(provider_id: String) -> Result<UnifiedGatewayStateView, String> {
+    let provider_id = provider_id.trim().to_string();
+    if provider_id.is_empty()
+        || provider_id == OFFICIAL_PROVIDER_ID
+        || provider_id == GROK_OAUTH_PROVIDER_ID
+    {
+        return Err("官方 Provider 和 Grok OAuth Provider 不能删除".to_string());
+    }
+    let mut store = load_store()?;
+    let Some(provider) = store.providers.iter().find(|item| item.id == provider_id) else {
+        return Err(format!("Provider 不存在: {provider_id}"));
+    };
+    let credential_ids = provider.credential_ref_ids.clone();
+    let secret_ids = store
+        .credential_refs
+        .iter()
+        .filter(|item| credential_ids.iter().any(|id| id == &item.id))
+        .filter_map(|item| item.secret_id.clone())
+        .collect::<Vec<_>>();
+    store.providers.retain(|item| item.id != provider_id);
+    store.models.retain(|item| item.provider_id != provider_id);
+    store
+        .credential_refs
+        .retain(|item| !credential_ids.iter().any(|id| id == &item.id));
+    store.updated_at = now_ms();
+    save_store(&store)?;
+    for secret_id in secret_ids {
+        credential_broker::delete_api_key_secret(&secret_id)?;
+    }
+    if store.lifecycle == UnifiedGatewayLifecycle::Active {
+        write_catalog(&profile_dir(), &store)?;
+        start_runtime(&store).await?;
+    }
+    get_state().await
+}
+
+fn stable_provider_id(display_name: &str, base_url: &str) -> String {
+    let seed = if display_name.trim().is_empty() {
+        base_url
+    } else {
+        display_name
+    };
+    let slug = seed
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "openai-compatible".to_string()
+    } else {
+        format!("openai-compat-{slug}")
+    }
 }
 
 pub async fn set_model_enabled(
@@ -1285,7 +1822,14 @@ pub async fn migrate_from_router() -> Result<UnifiedGatewayStateView, String> {
         return Err("未检测到旧 Codex Router 安装".to_string());
     }
     if preview.router_configured || preview.router_running {
-        let _ = codex_router::disable();
+        if let Err(error) = codex_router::disable() {
+            return Err(format!("停用旧 Codex Router 失败: {error}"));
+        }
+    }
+    if router_active() {
+        return Err(
+            "旧 Codex Router 仍在接管当前 Codex Profile，无法迁移。请先停用 Router。".to_string(),
+        );
     }
     let mut ids = preview.matched_grok_account_ids;
     if ids.is_empty() && preview.importable_local_grok {
@@ -1300,15 +1844,62 @@ pub async fn migrate_from_router() -> Result<UnifiedGatewayStateView, String> {
 }
 
 pub async fn restore_on_startup() {
-    let Ok(store) = load_store() else {
+    let Ok(mut store) = load_store() else {
         return;
     };
     if store.lifecycle != UnifiedGatewayLifecycle::Active {
         return;
     }
+    let profile = profile_dir();
+    if legacy_root_openai_config_is_owned(&profile, &store) {
+        match apply_managed_config(&profile, &store) {
+            Ok(managed_hash) => {
+                if let Some(backup) = store.backup.as_mut() {
+                    backup.managed_config_hash = managed_hash.clone();
+                }
+                if let Err(error) = write_profile_state(&profile, &store, &managed_hash) {
+                    push_event("error", "startup_transport_upgrade_failed", &error);
+                } else if let Err(error) = save_store(&store) {
+                    push_event("error", "startup_transport_upgrade_failed", &error);
+                } else {
+                    push_event(
+                        "info",
+                        "startup_transport_upgraded",
+                        "已迁移为保留 ChatGPT 鉴权的 HTTP/SSE 传输",
+                    );
+                }
+            }
+            Err(error) => push_event("error", "startup_transport_upgrade_failed", &error),
+        }
+    }
+    if let Err(error) = write_catalog(&profile, &store) {
+        push_event("warn", "startup_catalog_refresh_failed", &error);
+    }
     if let Err(error) = start_runtime(&store).await {
         push_event("error", "startup_restore_failed", &error);
     }
+}
+
+fn legacy_root_openai_config_is_owned(profile: &Path, store: &UnifiedGatewayStore) -> bool {
+    let Some(state) = read_profile_state(profile) else {
+        return false;
+    };
+    if state.ownership_id != store.ownership_id
+        || state.mode != "root-openai"
+        || state.managed_provider != "openai"
+        || state.managed_base_url != capability_base_url(store)
+    {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(config_path(profile)) else {
+        return false;
+    };
+    let Ok(doc) = codex_config_format::read_codex_config_doc_from_str(&content) else {
+        return false;
+    };
+    doc.get("openai_base_url")
+        .and_then(|item| item.as_str())
+        .is_some_and(|value| value == capability_base_url(store))
 }
 
 pub async fn shutdown_for_exit() {
@@ -1320,11 +1911,20 @@ fn sidecar_config_paths() -> Result<(PathBuf, PathBuf), String> {
     Ok((dir.join("config.json"), dir.join("manifest.json")))
 }
 
+fn sidecar_auth_dir() -> Result<PathBuf, String> {
+    let path = sidecar_dir()?.join("auths");
+    std::fs::create_dir_all(&path)
+        .map_err(|error| format!("创建统一网关 auth 目录失败: {error}"))?;
+    Ok(path)
+}
+
 fn write_sidecar_files(store: &UnifiedGatewayStore, socket_path: &Path) -> Result<(), String> {
     let (config_path, manifest_path) = sidecar_config_paths()?;
+    let auth_dir = sidecar_auth_dir()?;
     let config = json!({
         "host": if store.access_scope == UnifiedAccessScope::Lan { "0.0.0.0" } else { "127.0.0.1" },
         "port": store.port,
+        "auth-dir": auth_dir.to_string_lossy(),
         "debug": false,
         "api-keys": [],
         "request-log": false,
@@ -1394,6 +1994,11 @@ async fn start_runtime(store: &UnifiedGatewayStore) -> Result<(), String> {
     let binary = cliproxy_binary_path()?;
     let (config_path, manifest_path) = sidecar_config_paths()?;
     let mut command = TokioCommand::new(&binary);
+    #[cfg(target_os = "macos")]
+    {
+        command.env_remove("__CFBundleIdentifier");
+        command.env_remove("XPC_SERVICE_NAME");
+    }
     command
         .arg("--config")
         .arg(&config_path)
@@ -1418,21 +2023,40 @@ async fn start_runtime(store: &UnifiedGatewayStore) -> Result<(), String> {
             .await
             .map_err(|error| format!("写入 sidecar 握手失败: {error}"))?;
     }
+    let last_error = Arc::new(Mutex::new(None::<String>));
+    if let Some(stdout) = child.stdout.take() {
+        let last_error = Arc::clone(&last_error);
+        tauri::async_runtime::spawn(async move {
+            drain_sidecar_stream(stdout, last_error).await;
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let last_error = Arc::clone(&last_error);
+        tauri::async_runtime::spawn(async move {
+            drain_sidecar_stream(stderr, last_error).await;
+        });
+    }
     let pid = child.id().unwrap_or(0);
     if pid != 0 {
         credential_broker::set_expected_child_pid(pid).await;
     }
-    let ready = wait_sidecar_ready(store.port).await;
+    let ready = wait_sidecar_ready(store.port, &mut child, &last_error).await;
+    if let Err(error) = &ready {
+        let _ = child.kill().await;
+        let mut runtime = runtime().lock().await;
+        runtime.running = false;
+        runtime.child_pid = None;
+        runtime.last_error = Some(error.clone());
+        return Err(error.clone());
+    }
     let mut runtime = runtime().lock().await;
-    runtime.running = ready.is_ok();
+    runtime.running = true;
     runtime.child_pid = Some(pid);
-    runtime.last_error = ready.err();
+    runtime.last_error = None;
+    drop(runtime);
     tauri::async_runtime::spawn(async move {
         watch_child(child).await;
     });
-    if let Some(error) = runtime.last_error.clone() {
-        return Err(error);
-    }
     Ok(())
 }
 
@@ -1456,13 +2080,55 @@ async fn stop_runtime() {
     }
 }
 
-async fn wait_sidecar_ready(port: u16) -> Result<(), String> {
+async fn drain_sidecar_stream<R>(stream: R, last_error: Arc<Mutex<Option<String>>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        push_event("info", "sidecar", trimmed);
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if value.get("type").and_then(Value::as_str) == Some("error") {
+                if let Some(message) = value.get("message").and_then(Value::as_str) {
+                    if let Ok(mut slot) = last_error.lock() {
+                        *slot = Some(message.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sidecar_startup_error(last_error: &Arc<Mutex<Option<String>>>, fallback: String) -> String {
+    last_error
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or(fallback)
+}
+
+async fn wait_sidecar_ready(
+    port: u16,
+    child: &mut Child,
+    last_error: &Arc<Mutex<Option<String>>>,
+) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{port}/healthz");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(400))
         .build()
         .map_err(|error| error.to_string())?;
-    for _ in 0..40 {
+    for _ in 0..80 {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(sidecar_startup_error(
+                last_error,
+                format!("统一网关 sidecar 已退出 ({status})"),
+            ));
+        }
         if client.get(&url).send().await.is_ok() {
             return Ok(());
         }
@@ -1471,7 +2137,10 @@ async fn wait_sidecar_ready(port: u16) -> Result<(), String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
-    Err(format!("统一网关 sidecar 未在端口 {port} 就绪"))
+    Err(sidecar_startup_error(
+        last_error,
+        format!("统一网关 sidecar 未在端口 {port} 就绪"),
+    ))
 }
 
 struct TcpReady;
@@ -1580,7 +2249,7 @@ mod tests {
     #[test]
     fn namespaces_external_model_when_official_id_collides() {
         let official = HashSet::from(["gpt-5.4".to_string()]);
-        let model = namespaced_if_conflict(
+        let model = namespaced_model(
             UnifiedModel {
                 id: "gpt-5.4".to_string(),
                 provider_id: "xai-api".to_string(),
@@ -1589,7 +2258,7 @@ mod tests {
             },
             &official,
         );
-        assert_eq!(model.id, "cockpit.gpt-5.4");
+        assert_eq!(model.id, "xai-api/gpt-5.4");
     }
 
     #[test]
@@ -1605,6 +2274,55 @@ mod tests {
         }
         let catalog = build_catalog_json(&store).unwrap();
         assert!(!catalog.contains("grok-4.5"));
+    }
+
+    #[test]
+    fn catalog_prefers_websockets_only_for_official_models() {
+        let _env = isolated_env();
+        let mut store = load_store().unwrap();
+        for model in store.models.iter_mut() {
+            if model.provider_id == GROK_OAUTH_PROVIDER_ID {
+                model.enabled = true;
+            }
+        }
+        let catalog = build_catalog_json(&store).unwrap();
+        let parsed: Value = serde_json::from_str(&catalog).unwrap();
+        let models = parsed.get("models").and_then(Value::as_array).unwrap();
+        let mut saw_official = false;
+        let mut saw_grok = false;
+        for model in models {
+            let id = model
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| model.get("slug").and_then(Value::as_str))
+                .unwrap_or_default();
+            let prefer = model
+                .get("prefer_websockets")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if id.starts_with("gpt-") {
+                assert!(prefer, "{id} should prefer websockets");
+                saw_official = true;
+            }
+            if id.starts_with("grok-oauth/") {
+                assert!(!prefer, "{id} should use HTTP responses");
+                saw_grok = true;
+            }
+        }
+        assert!(saw_official && saw_grok, "catalog={catalog}");
+    }
+
+    #[test]
+    fn sidecar_config_writes_auth_dir() {
+        let _env = isolated_env();
+        let store = load_store().unwrap();
+        write_sidecar_files(&store, Path::new("/tmp/credential-broker.sock")).unwrap();
+        let config = fs::read_to_string(sidecar_dir().unwrap().join("config.json")).unwrap();
+        assert!(
+            config.contains("auth-dir"),
+            "sidecar config missing auth-dir: {config}"
+        );
+        assert!(sidecar_dir().unwrap().join("auths").is_dir());
     }
 
     #[test]
@@ -1627,17 +2345,76 @@ mod tests {
         let auth = fs::read_to_string(profile.join("auth.json")).unwrap();
         assert!(auth.contains("keep-me"));
         let config = fs::read_to_string(profile.join("config.toml")).unwrap();
-        assert!(config.contains("openai_base_url"));
+        assert!(config.contains("model_provider = \"cockpit-unified-gateway\""));
+        assert!(config.contains("[model_providers.cockpit-unified-gateway]"));
+        assert!(config.contains("requires_openai_auth = true"));
+        assert!(config.contains("supports_websockets = false"));
+        assert!(!config.contains("openai_base_url"));
         assert!(config.contains("project_doc_max_bytes = 12"));
         assert!(
             config.contains("/_cockpit-ugw/"),
             "managed config missing capability path: {config}"
         );
+        let catalog = catalog_path(&profile);
+        assert!(
+            config.contains(&catalog.to_string_lossy().to_string()),
+            "model_catalog_json must be an absolute path: {config}"
+        );
         let mut doc = codex_config_format::read_codex_config_doc_from_str(&config).unwrap();
         remove_managed_fields(&mut doc);
         let restored = doc.to_string();
         assert!(!restored.contains("openai_base_url"));
+        assert!(!restored.contains("model_catalog_json"));
+        assert!(!restored.contains("cockpit-unified-gateway"));
         assert!(restored.contains("project_doc_max_bytes"));
+    }
+
+    #[test]
+    fn apply_managed_config_strips_reserved_openai_provider_override() {
+        let (_lock, _guard, profile) = isolated_env();
+        fs::write(
+            profile.join("config.toml"),
+            "model = \"gpt-5.4\"\n\n[model_providers.openai]\nrequires_openai_auth = true\n",
+        )
+        .unwrap();
+        let mut store = load_store().unwrap();
+        store.capability_token = "tokentoken1234567890abcd".to_string();
+        apply_managed_config(&profile, &store).unwrap();
+        let config = fs::read_to_string(profile.join("config.toml")).unwrap();
+        assert!(!config.contains("[model_providers.openai]"));
+        assert!(config.contains("[model_providers.cockpit-unified-gateway]"));
+        assert!(config.contains("requires_openai_auth = true"));
+        assert!(config.contains("supports_websockets = false"));
+    }
+
+    #[test]
+    fn legacy_root_openai_config_is_recognized_for_startup_upgrade() {
+        let (_lock, _guard, profile) = isolated_env();
+        let mut store = load_store().unwrap();
+        store.capability_token = "tokentoken1234567890abcd".to_string();
+        let base_url = capability_base_url(&store);
+        fs::write(
+            profile.join("config.toml"),
+            format!("model = \"grok-oauth/grok-4.5\"\nopenai_base_url = \"{base_url}\"\n"),
+        )
+        .unwrap();
+        let legacy_state = UnifiedGatewayProfileState {
+            version: 1,
+            ownership_id: store.ownership_id.clone(),
+            mode: "root-openai".to_string(),
+            managed_provider: "openai".to_string(),
+            managed_base_url: base_url,
+            catalog_file: catalog_path(&profile).to_string_lossy().to_string(),
+            original_config_hash: String::new(),
+            managed_config_hash: String::new(),
+            updated_at: now_ms(),
+        };
+        fs::write(
+            profile_state_path(&profile),
+            serde_json::to_string(&legacy_state).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy_root_openai_config_is_owned(&profile, &store));
     }
 
     #[test]
@@ -1659,6 +2436,60 @@ mod tests {
             fs::read_to_string(profile.join("config.toml")).unwrap(),
             "model = \"user-changed\"\n"
         );
+    }
+
+    #[test]
+    fn restore_strips_catalog_key_even_when_backup_still_points_at_it() {
+        let (_lock, _guard, profile) = isolated_env();
+        let catalog = catalog_path(&profile);
+        fs::write(
+            profile.join("config.toml"),
+            format!(
+                "model = \"gpt-5.6-luna\"\nproject_doc_max_bytes = 12\nmodel_catalog_json = \"{}\"\nopenai_base_url = \"http://127.0.0.1:1457/_cockpit-ugw/tokentoken1234567890abcd/v1\"\n",
+                catalog.display()
+            ),
+        )
+        .unwrap();
+        fs::write(&catalog, "{\"models\":[]}\n").unwrap();
+        let mut store = load_store().unwrap();
+        backup_profile(&profile, &mut store).unwrap();
+        let backup_id = store.backup.as_ref().unwrap().backup_id.clone();
+        let backup_file = backup_root().unwrap().join(backup_id).join("config.toml");
+        fs::write(
+            &backup_file,
+            format!(
+                "model = \"gpt-5.6-luna\"\nproject_doc_max_bytes = 12\nmodel_catalog_json = \"{}\"\n",
+                catalog.display()
+            ),
+        )
+        .unwrap();
+        restore_official_mode(&profile, &store, true).unwrap();
+        let restored = fs::read_to_string(profile.join("config.toml")).unwrap();
+        assert!(
+            !restored.contains("model_catalog_json"),
+            "dangling catalog key left behind: {restored}"
+        );
+        assert!(!restored.contains("openai_base_url"), "{restored}");
+        assert!(restored.contains("project_doc_max_bytes"), "{restored}");
+        assert!(!catalog.exists(), "catalog file should be removed");
+    }
+
+    #[test]
+    fn backup_profile_strips_managed_keys() {
+        let (_lock, _guard, profile) = isolated_env();
+        fs::write(
+            profile.join("config.toml"),
+            "model = \"gpt-5.6-luna\"\nmodel_catalog_json = \"/tmp/missing.json\"\nopenai_base_url = \"http://127.0.0.1:1457/_cockpit-ugw/tok/v1\"\nkeep_me = true\n",
+        )
+        .unwrap();
+        let mut store = load_store().unwrap();
+        backup_profile(&profile, &mut store).unwrap();
+        let backup_id = store.backup.as_ref().unwrap().backup_id.clone();
+        let backup =
+            fs::read_to_string(backup_root().unwrap().join(backup_id).join("config.toml")).unwrap();
+        assert!(!backup.contains("model_catalog_json"), "{backup}");
+        assert!(!backup.contains("openai_base_url"), "{backup}");
+        assert!(backup.contains("keep_me"), "{backup}");
     }
 
     #[test]
@@ -1696,7 +2527,8 @@ mod tests {
         }));
         assert!(routes.iter().any(|route| {
             route.get("route").and_then(|item| item.as_str()) == Some("grok-oauth")
-                && route.get("modelId").and_then(|item| item.as_str()) == Some("grok-4.5")
+                && route.get("modelId").and_then(|item| item.as_str())
+                    == Some("grok-oauth/grok-4.5")
         }));
         let encoded = serde_json::to_string(&manifest).unwrap();
         assert!(!encoded.contains("refresh_token"));

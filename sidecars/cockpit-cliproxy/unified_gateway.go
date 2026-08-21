@@ -92,6 +92,8 @@ func (m *manifest) unifiedGatewayEnabled() bool {
 	return m != nil && m.UnifiedGateway != nil && m.UnifiedGateway.Enabled
 }
 
+type unifiedGatewayAuthKey struct{}
+
 func stripUnifiedGatewayPrefix(path, token string) (string, bool) {
 	prefix := unifiedGatewayPrefix + strings.TrimSpace(token)
 	if !strings.HasPrefix(path, prefix) {
@@ -105,6 +107,38 @@ func stripUnifiedGatewayPrefix(path, token string) (string, bool) {
 		rest = "/" + rest
 	}
 	return rest, true
+}
+
+// wrapUnifiedGatewayHandler rewrites /_cockpit-ugw/{token}/... to /... before
+// Gin routing. Middleware path rewrites cannot rematch already-selected routes,
+// so capability URLs otherwise fall through to NoRoute ("endpoint not supported").
+func wrapUnifiedGatewayHandler(manifest *manifest, inner http.Handler) http.Handler {
+	if inner == nil {
+		return inner
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if manifest == nil || !manifest.unifiedGatewayEnabled() || r == nil || r.URL == nil {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		rewritten, ok := stripUnifiedGatewayPrefix(r.URL.Path, manifest.UnifiedGateway.CapabilityToken)
+		if !ok {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		clone := r.Clone(context.WithValue(r.Context(), unifiedGatewayAuthKey{}, true))
+		clone.URL.Path = rewritten
+		clone.URL.RawPath = rewritten
+		inner.ServeHTTP(w, clone)
+	})
+}
+
+func unifiedGatewayAuthorizedFromRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	authorized, _ := r.Context().Value(unifiedGatewayAuthKey{}).(bool)
+	return authorized
 }
 
 func unifiedRouteForModel(cfg *unifiedGatewayConfig, model string) *unifiedGatewayRoute {
@@ -134,22 +168,18 @@ func (s *relayServer) unifiedGatewayMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		cfg := s.manifest.UnifiedGateway
-		rewritten, ok := stripUnifiedGatewayPrefix(c.Request.URL.Path, cfg.CapabilityToken)
-		if !ok {
-			if strings.HasPrefix(c.Request.URL.Path, unifiedGatewayPrefix) {
-				writeAPIError(c, http.StatusNotFound, "unknown unified gateway capability path", "not_found")
+		if unifiedGatewayAuthorizedFromRequest(c.Request) {
+			c.Set("unifiedGatewayAuthorized", true)
+			if isModelsRequest(c.Request) {
+				s.handleUnifiedModels(c)
 				c.Abort()
 				return
 			}
 			c.Next()
 			return
 		}
-		c.Request.URL.Path = rewritten
-		c.Request.URL.RawPath = rewritten
-		c.Set("unifiedGatewayAuthorized", true)
-		if isModelsRequest(c.Request) {
-			s.handleUnifiedModels(c)
+		if strings.HasPrefix(c.Request.URL.Path, unifiedGatewayPrefix) {
+			writeAPIError(c, http.StatusNotFound, "unknown unified gateway capability path", "not_found")
 			c.Abort()
 			return
 		}
@@ -173,7 +203,19 @@ func (s *relayServer) handleUnifiedModels(c *gin.Context) {
 		}
 	}
 	if isCodexClientModelsRequest(c.Request) {
-		c.JSON(http.StatusOK, buildCodexClientModelsResponse(ids, nil, nil))
+		response := buildCodexClientModelsResponse(ids, nil, nil)
+		if models, ok := response["models"].([]map[string]any); ok {
+			cfg := s.manifest.UnifiedGateway
+			for _, model := range models {
+				id, _ := model["id"].(string)
+				if id == "" {
+					id, _ = model["slug"].(string)
+				}
+				route := unifiedRouteForModel(cfg, id)
+				model["prefer_websockets"] = route != nil && (route.Route == unifiedOfficialRoute || route.ProviderID == unifiedOfficialProvider)
+			}
+		}
+		c.JSON(http.StatusOK, response)
 		return
 	}
 	c.JSON(http.StatusOK, buildModelsResponse(ids))
@@ -207,9 +249,24 @@ func (s *relayServer) tryHandleUnifiedRequest(c *gin.Context, body []byte, sourc
 	case route.Route == unifiedGrokRoute || route.ProviderID == unifiedGrokProvider:
 		s.handleGrokOAuthRequest(c, body, route, sourceFormat, fixedAlt)
 	default:
-		s.handleBrokerProviderRequest(c, body, route)
+		s.handleBrokerProviderRequest(c, body, route, sourceFormat, fixedAlt)
 	}
 	return true
+}
+
+func websocketEnvelopeModel(raw []byte) string {
+	if model := requestBodyModel(raw); model != "" {
+		return model
+	}
+	var nested struct {
+		Response struct {
+			Model string `json:"model"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(raw, &nested) != nil {
+		return ""
+	}
+	return strings.TrimSpace(nested.Response.Model)
 }
 
 func requestSessionID(body []byte, header http.Header) string {

@@ -157,6 +157,22 @@ pub async fn unified_gateway_upsert_api_provider(
 }
 
 #[tauri::command]
+pub async fn unified_gateway_delete_api_provider(
+    provider_id: String,
+) -> Result<crate::models::unified_model_gateway::UnifiedGatewayStateView, String> {
+    unified_model_gateway::delete_api_provider(provider_id).await
+}
+
+#[tauri::command]
+pub async fn unified_gateway_test_provider(
+    base_url: String,
+    api_key: String,
+    wire_api: String,
+) -> Result<Vec<String>, String> {
+    unified_model_gateway::test_api_provider(base_url, api_key, wire_api).await
+}
+
+#[tauri::command]
 pub async fn unified_gateway_set_model_enabled(
     model_id: String,
     enabled: bool,
