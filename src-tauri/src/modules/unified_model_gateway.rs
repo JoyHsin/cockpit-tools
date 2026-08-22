@@ -49,7 +49,12 @@ const QUOTA_TTL_MS: i64 = 10 * 60 * 1000;
 const SUPPORTED_CODEX_RANGE: &str = "verified-codex-app-cli-first-release";
 const THREAT_MODEL_NOTE: &str =
     "Prevents network, other OS users, and accidental local programs from using the gateway. A malicious process running as the same OS user that can read Cockpit's private config is outside this desktop app's isolated threat model.";
-const MANAGED_KEYS: &[&str] = &["openai_base_url", "model_catalog_json"];
+const MANAGED_KEYS: &[&str] = &[
+    "openai_base_url",
+    "model_catalog_json",
+    "experimental_realtime_webrtc_call_base_url",
+    "experimental_realtime_ws_base_url",
+];
 
 static STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static RUNTIME: OnceLock<TokioMutex<GatewayRuntime>> = OnceLock::new();
@@ -712,12 +717,10 @@ fn apply_managed_config(profile: &Path, store: &UnifiedGatewayStore) -> Result<S
             "当前 Codex Profile 使用了自定义 Provider，统一网关不会覆盖该配置。".to_string(),
         );
     }
-    // A root `openai_base_url` leaves the built-in OpenAI provider's
-    // WebSocket capability enabled. Codex then connects before it knows the
-    // target model, and the relay can only forward it to ChatGPT. Use a
-    // dedicated provider instead so the client keeps ChatGPT auth but always
-    // uses the HTTP/SSE transport where routing is model-aware.
-    let _ = doc.remove("openai_base_url");
+    // Root `openai_base_url` routes Codex Desktop GUI / CLI traffic to the gateway
+    // for initial model listing (GET /v1/models) and default routing.
+    // The gateway rejects WebSocket upgrades with 426 to force client downgrade to HTTP/SSE.
+    doc["openai_base_url"] = value(capability_base_url(store));
     doc["model_provider"] = value(UNIFIED_GATEWAY_CODEX_PROVIDER_ID);
     if doc.get("model_providers").is_none() {
         doc["model_providers"] = toml_edit::table();
@@ -739,6 +742,13 @@ fn apply_managed_config(profile: &Path, store: &UnifiedGatewayStore) -> Result<S
     // Newer Codex requires an absolute path here; a bare filename fails with
     // "AbsolutePathBuf deserialized without a base path".
     doc["model_catalog_json"] = value(catalog_path(profile).to_string_lossy().to_string());
+    if doc.get("experimental_realtime_webrtc_call_base_url").is_none() {
+        doc["experimental_realtime_webrtc_call_base_url"] =
+            value("https://chatgpt.com/backend-api/codex");
+    }
+    if doc.get("experimental_realtime_ws_base_url").is_none() {
+        doc["experimental_realtime_ws_base_url"] = value("https://api.openai.com/v1");
+    }
     // Built-in `openai` already sends official auth. Overriding
     // `[model_providers.openai]` is rejected as a reserved provider ID.
     remove_reserved_openai_provider_override(&mut doc);
@@ -2349,7 +2359,7 @@ mod tests {
         assert!(config.contains("[model_providers.cockpit-unified-gateway]"));
         assert!(config.contains("requires_openai_auth = true"));
         assert!(config.contains("supports_websockets = false"));
-        assert!(!config.contains("openai_base_url"));
+        assert!(config.contains("openai_base_url"));
         assert!(config.contains("project_doc_max_bytes = 12"));
         assert!(
             config.contains("/_cockpit-ugw/"),

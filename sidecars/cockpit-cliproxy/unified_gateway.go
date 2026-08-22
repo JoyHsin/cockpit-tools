@@ -126,6 +126,11 @@ func wrapUnifiedGatewayHandler(manifest *manifest, inner http.Handler) http.Hand
 			inner.ServeHTTP(w, r)
 			return
 		}
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+			w.Header().Set("Connection", "close")
+			w.WriteHeader(http.StatusUpgradeRequired)
+			return
+		}
 		clone := r.Clone(context.WithValue(r.Context(), unifiedGatewayAuthKey{}, true))
 		clone.URL.Path = rewritten
 		clone.URL.RawPath = rewritten
@@ -205,14 +210,12 @@ func (s *relayServer) handleUnifiedModels(c *gin.Context) {
 	if isCodexClientModelsRequest(c.Request) {
 		response := buildCodexClientModelsResponse(ids, nil, nil)
 		if models, ok := response["models"].([]map[string]any); ok {
-			cfg := s.manifest.UnifiedGateway
 			for _, model := range models {
 				id, _ := model["id"].(string)
 				if id == "" {
 					id, _ = model["slug"].(string)
 				}
-				route := unifiedRouteForModel(cfg, id)
-				model["prefer_websockets"] = route != nil && (route.Route == unifiedOfficialRoute || route.ProviderID == unifiedOfficialProvider)
+				model["prefer_websockets"] = false
 			}
 		}
 		c.JSON(http.StatusOK, response)

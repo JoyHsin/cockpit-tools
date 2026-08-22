@@ -1284,15 +1284,22 @@ func (p *requestPolicy) emitBlockedRequest(c *gin.Context, requestID string, spe
 }
 
 func isModelsRequest(r *http.Request) bool {
-	return r != nil && r.Method == http.MethodGet && r.URL != nil && r.URL.Path == "/v1/models"
+	if r == nil || r.Method != http.MethodGet || r.URL == nil {
+		return false
+	}
+	p := strings.TrimRight(r.URL.Path, "/")
+	return p == "/v1/models" || p == "/models" || p == "/backend-api/codex/models"
 }
 
 func isCodexClientModelsRequest(r *http.Request) bool {
 	if r == nil || r.URL == nil {
 		return false
 	}
-	_, ok := r.URL.Query()["client_version"]
-	return ok
+	if _, ok := r.URL.Query()["client_version"]; ok {
+		return true
+	}
+	p := strings.TrimRight(r.URL.Path, "/")
+	return p == "/backend-api/codex/models"
 }
 
 func buildModelsResponse(models []string) gin.H {

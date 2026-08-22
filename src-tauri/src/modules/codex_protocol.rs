@@ -165,7 +165,10 @@ pub fn apply_unified_model_metadata(
         object.remove("web_search_tool_type");
     }
     if metadata.reasoning_efforts.is_empty() {
-        object.remove("supported_reasoning_levels");
+        object.insert(
+            "supported_reasoning_levels".to_string(),
+            Value::Array(Vec::new()),
+        );
         object.remove("default_reasoning_level");
     } else {
         let existing = object

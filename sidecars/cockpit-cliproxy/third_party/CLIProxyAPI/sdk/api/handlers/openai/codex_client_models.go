@@ -423,7 +423,7 @@ func sanitizeCodexClientReasoningMetadata(entry map[string]any) {
 	}
 
 	if len(levels) == 0 {
-		delete(entry, "supported_reasoning_levels")
+		entry["supported_reasoning_levels"] = []any{}
 		delete(entry, "default_reasoning_level")
 		return
 	}
