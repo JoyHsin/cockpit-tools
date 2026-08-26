@@ -1746,7 +1746,7 @@ pub async fn import_codex_access_token_account(
         .ok_or_else(|| "Account could not be loaded after import".to_string())
 }
 
-/// 从本地 auth.json 导入账号
+/// 从官方 Codex 本机凭据存储导入账号（auth.json / macOS Keychain）
 #[tauri::command]
 pub async fn import_codex_from_local(app: AppHandle) -> Result<CodexAccount, String> {
     let account = codex_account::import_from_local()?;
@@ -1959,6 +1959,15 @@ async fn save_codex_oauth_tokens(
 
     let loaded =
         codex_account::load_account(&account.id).ok_or_else(|| "账号保存后无法读取".to_string())?;
+    if reauth_account_id.is_some() {
+        if let Err(error) = codex_account::sync_bound_oauth_consumers_after_reauth(&loaded.id).await
+        {
+            logger::log_warn(&format!(
+                "OAuth 重新授权后同步绑定消费者失败，保留已保存授权: account_id={}, error={}",
+                loaded.id, error
+            ));
+        }
+    }
     logger::log_info(&format!(
         "Codex OAuth 账号已保存: account_id={}, email={}",
         loaded.id, loaded.email
