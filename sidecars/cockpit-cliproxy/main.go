@@ -30,6 +30,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
+	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
+	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	internalregistry "github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
@@ -1063,7 +1065,7 @@ func (p *requestPolicy) middleware() gin.HandlerFunc {
 			return
 		}
 
-		if spec == nil || !shouldInspectJSONBody(c.Request) {
+		if spec == nil || isCodexLiveRequest(c.Request) || !shouldInspectJSONBody(c.Request) {
 			emitStart()
 			c.Next()
 			return
@@ -1533,12 +1535,12 @@ func buildCodexClientModelsResponse(models []string, spec *apiKeySpec, windows m
 		}
 		sourceModels = append(sourceModels, entry)
 	}
-	response := gin.H(sdkopenai.CodexClientModelsResponseWithProviders(sourceModels, func(string) []string {
+	response := gin.H(codexmodels.BuildResponse(sourceModels, func(string) []string {
 		if spec != nil && spec.ProviderGateway != nil {
 			return []string{"provider-gateway"}
 		}
 		return []string{"codex"}
-	}))
+	}, false))
 	if data, ok := response["models"].([]map[string]any); ok {
 		hydrateCodexCompatibilityModels(data)
 		preferWebsockets := spec != nil && spec.ProviderGateway == nil && spec.ResponsesWebsockets
@@ -1687,6 +1689,19 @@ func shouldInspectJSONBody(r *http.Request) bool {
 	}
 	contentType := strings.ToLower(r.Header.Get("Content-Type"))
 	return strings.Contains(contentType, "application/json") || contentType == ""
+}
+
+func isCodexLiveRequest(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	path := strings.TrimRight(strings.TrimSpace(r.URL.Path), "/")
+	return path == "/v1/live" ||
+		strings.HasPrefix(path, "/v1/live/") ||
+		path == "/v1/realtime" ||
+		path == "/v1/realtime/calls" ||
+		strings.HasPrefix(path, "/v1/realtime/calls/") ||
+		strings.HasPrefix(path, "/v1/realtime/")
 }
 
 func readAndRestoreBody(r *http.Request) ([]byte, error) {
@@ -3479,7 +3494,7 @@ func (s *cockpitSessionAffinitySelector) Pick(ctx context.Context, provider, mod
 		for key, value := range opts.Metadata {
 			metadata[key] = value
 		}
-		metadata[cliproxyexecutor.SessionAffinityNamespaceMetadataKey] = spec.ID
+		metadata[cliproxyexecutor.CallerScopeMetadataKey] = spec.ID
 		opts.Metadata = metadata
 	}
 	return s.inner.Pick(ctx, provider, model, opts, auths)
@@ -3671,7 +3686,6 @@ func newSidecarRuntime(ctx context.Context, configPath string, cfg *config.Confi
 
 	authManager := sdkauth.NewManager(
 		sdkauth.GetTokenStore(),
-		sdkauth.NewGeminiAuthenticator(),
 		sdkauth.NewCodexAuthenticator(),
 		sdkauth.NewClaudeAuthenticator(),
 		sdkauth.NewAntigravityAuthenticator(),
@@ -4294,8 +4308,43 @@ func manifestRegistryModelInfo(id string, source string, created int64) *cliprox
 		}
 		return info
 	}
+	if thinking := codexClientThinkingSupport(lookupID); thinking != nil {
+		info.Thinking = thinking
+		return info
+	}
 	info.UserDefined = true
 	return info
+}
+
+func codexClientThinkingSupport(modelID string) *internalregistry.ThinkingSupport {
+	var catalog struct {
+		Models []map[string]any `json:"models"`
+	}
+	if errDecode := json.Unmarshal(internalregistry.GetCodexClientModelsJSON(), &catalog); errDecode != nil {
+		return nil
+	}
+	for _, model := range catalog.Models {
+		if !strings.EqualFold(strings.TrimSpace(stringFieldFromAny(model["slug"])), strings.TrimSpace(modelID)) {
+			continue
+		}
+		levels, ok := model["supported_reasoning_levels"].([]any)
+		if !ok || len(levels) == 0 {
+			return nil
+		}
+		out := &internalregistry.ThinkingSupport{}
+		for _, raw := range levels {
+			if level, ok := raw.(map[string]any); ok {
+				if effort := strings.TrimSpace(stringFieldFromAny(level["effort"])); effort != "" {
+					out.Levels = append(out.Levels, effort)
+				}
+			}
+		}
+		if len(out.Levels) == 0 {
+			return nil
+		}
+		return out
+	}
+	return nil
 }
 
 type sidecarRoundTripperProvider struct {
@@ -4350,6 +4399,7 @@ type relayServer struct {
 	emitter            *eventEmitter
 	policy             *requestPolicy
 	responsesWebsocket gin.HandlerFunc
+	codexLive          *codexlive.Handler
 	quotaPoolStatePath string
 	grokPool           *grokPoolState
 }
@@ -4364,6 +4414,23 @@ func (s *relayServer) router() *gin.Engine {
 	router.GET("/v1/models", s.handleModels)
 	router.GET(cockpitQuotaPath, s.handleCockpitQuota)
 	router.POST("/v1/cockpit/auth/reset", s.handleResetAuthState)
+	router.POST("/v1/cockpit/accounts/reset-scheduler", s.handleResetSchedulerState)
+	router.POST("/v1/live", s.handleCodexLive)
+	router.GET("/v1/live/:call_id", s.handleCodexLiveSideband)
+	router.POST("/v1/realtime/calls", s.handleCodexLive)
+	router.GET("/v1/realtime/calls/:call_id", s.handleCodexLiveSideband)
+	router.GET("/v1/realtime", s.handleCodexRealtimeWebsocket)
+	router.POST("/v1/realtime", s.handleCodexRealtime)
+	router.POST("/v1/realtime/client_secrets", s.handleCodexClientSecret)
+	router.POST("/v1/realtime/sessions", s.handleCodexLegacySession)
+	router.POST("/v1/realtime/transcription_sessions", s.handleCodexTranscriptionSession)
+	router.GET("/v1/realtime/translations", s.handleCodexTranslation)
+	router.POST("/v1/realtime/translations", s.handleCodexTranslation)
+	router.POST("/v1/realtime/translations/client_secrets", s.handleCodexTranslation)
+	router.POST("/v1/realtime/calls/:call_id/hangup", s.handleCodexHangup)
+	router.POST("/v1/realtime/calls/:call_id/accept", s.handleCodexSIPControl)
+	router.POST("/v1/realtime/calls/:call_id/reject", s.handleCodexSIPControl)
+	router.POST("/v1/realtime/calls/:call_id/refer", s.handleCodexSIPControl)
 	// Codex Responses WebSocket upgrade uses GET /v1/responses (not POST/SSE).
 	router.GET("/v1/responses", s.handleResponsesWebsocket)
 	router.POST("/v1/responses", s.handleResponses)
@@ -4769,6 +4836,104 @@ func (s *relayServer) handleResetAuthState(c *gin.Context) {
 	})
 }
 
+// handleResetSchedulerState resets the runtime scheduler state for accounts in
+// the current API key scope. It resolves auth-manager entries through manifest
+// identity data so both OAuth accounts and API-key accounts without authId are
+// handled by the same endpoint.
+func (s *relayServer) handleResetSchedulerState(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	if s.manifest == nil {
+		writeAPIError(c, http.StatusServiceUnavailable, "account manifest unavailable", "service_unavailable")
+		return
+	}
+
+	var req resetAuthStateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeAPIError(c, http.StatusBadRequest, "invalid request body", "invalid_request")
+		return
+	}
+
+	accountIDs := normalizeStringList(req.AccountIDs)
+	if len(accountIDs) == 0 {
+		writeAPIError(c, http.StatusBadRequest, "accountIds is required", "invalid_request")
+		return
+	}
+
+	allowed := make(map[string]struct{}, len(spec.AccountIDs))
+	for _, accountID := range spec.AccountIDs {
+		if accountID = strings.TrimSpace(accountID); accountID != "" {
+			allowed[accountID] = struct{}{}
+		}
+	}
+
+	selected := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		account := s.manifest.accountByID[accountID]
+		if account == nil {
+			continue
+		}
+		if len(allowed) > 0 {
+			if _, ok := allowed[accountID]; !ok {
+				continue
+			}
+		}
+		selected = append(selected, accountID)
+	}
+	if len(selected) == 0 {
+		writeAPIError(c, http.StatusNotFound, "no matching accounts found", "account_not_found")
+		return
+	}
+
+	selectedSet := make(map[string]struct{}, len(selected))
+	for _, accountID := range selected {
+		selectedSet[accountID] = struct{}{}
+	}
+	authIDs := make(map[string]struct{})
+	if s.authManager != nil {
+		for _, auth := range s.authManager.List() {
+			account := accountForAuthInManifest(s.manifest, auth)
+			if account == nil {
+				continue
+			}
+			if _, ok := selectedSet[account.ID]; ok && strings.TrimSpace(auth.ID) != "" {
+				authIDs[auth.ID] = struct{}{}
+			}
+		}
+	}
+	for _, accountID := range selected {
+		if authID := strings.TrimSpace(s.manifest.accountByID[accountID].AuthID); authID != "" {
+			authIDs[authID] = struct{}{}
+		}
+	}
+	if len(authIDs) > 0 && s.authManager == nil {
+		writeAPIError(c, http.StatusServiceUnavailable, "auth manager unavailable", "service_unavailable")
+		return
+	}
+
+	resetAuthCount := 0
+	for authID := range authIDs {
+		updated, err := s.authManager.ResetAuthState(c.Request.Context(), authID)
+		if err != nil {
+			writeAPIError(c, http.StatusBadGateway, err.Error(), "scheduler_reset_failed")
+			return
+		}
+		if updated != nil {
+			resetAuthCount++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":         "ok",
+		"reset":          resetAuthCount,
+		"accountIds":     selected,
+		"authReset":      resetAuthCount,
+		"schedulerReset": len(selected),
+	})
+}
+
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
@@ -4797,6 +4962,86 @@ func (s *relayServer) handleModels(c *gin.Context) {
 
 func (s *relayServer) handleResponses(c *gin.Context) {
 	s.handleExecutorRequest(c, sdktranslator.FormatOpenAIResponse, "")
+}
+
+func (s *relayServer) handleCodexLive(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	if spec.ProviderGateway != nil {
+		writeAPIError(c, http.StatusBadRequest, "provider gateway does not support Codex live", "live_not_supported")
+		return
+	}
+	if s.codexLive == nil {
+		writeAPIError(c, http.StatusServiceUnavailable, "Codex live unavailable", "service_unavailable")
+		return
+	}
+	s.codexLive.Handle(c)
+}
+
+func (s *relayServer) handleCodexLiveSideband(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	if spec.ProviderGateway != nil {
+		writeAPIError(c, http.StatusBadRequest, "provider gateway does not support Codex live", "live_not_supported")
+		return
+	}
+	if s.codexLive == nil {
+		writeAPIError(c, http.StatusServiceUnavailable, "Codex live unavailable", "service_unavailable")
+		return
+	}
+	s.codexLive.HandleSideband(c)
+}
+
+func (s *relayServer) codexRealtimeHandler(c *gin.Context, handle func(*codexlive.Handler, *gin.Context)) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	if spec.ProviderGateway != nil {
+		writeAPIError(c, http.StatusBadRequest, "provider gateway does not support Codex realtime", "realtime_not_supported")
+		return
+	}
+	if s.codexLive == nil {
+		writeAPIError(c, http.StatusServiceUnavailable, "Codex realtime unavailable", "service_unavailable")
+		return
+	}
+	handle(s.codexLive, c)
+}
+
+func (s *relayServer) handleCodexRealtimeWebsocket(c *gin.Context) {
+	s.codexRealtimeHandler(c, func(h *codexlive.Handler, ctx *gin.Context) { h.HandleRealtimeWebsocket(ctx) })
+}
+
+func (s *relayServer) handleCodexRealtime(c *gin.Context) {
+	s.codexRealtimeHandler(c, func(h *codexlive.Handler, ctx *gin.Context) { h.Handle(ctx) })
+}
+
+func (s *relayServer) handleCodexClientSecret(c *gin.Context) {
+	s.codexRealtimeHandler(c, func(h *codexlive.Handler, ctx *gin.Context) { h.CreateClientSecret(ctx) })
+}
+
+func (s *relayServer) handleCodexLegacySession(c *gin.Context) {
+	s.codexRealtimeHandler(c, func(h *codexlive.Handler, ctx *gin.Context) { h.CreateLegacySession(ctx) })
+}
+
+func (s *relayServer) handleCodexTranscriptionSession(c *gin.Context) {
+	s.codexRealtimeHandler(c, func(h *codexlive.Handler, ctx *gin.Context) { h.HandleTranscriptionSession(ctx) })
+}
+
+func (s *relayServer) handleCodexTranslation(c *gin.Context) {
+	s.codexRealtimeHandler(c, func(h *codexlive.Handler, ctx *gin.Context) { h.HandleTranslation(ctx) })
+}
+
+func (s *relayServer) handleCodexHangup(c *gin.Context) {
+	s.codexRealtimeHandler(c, func(h *codexlive.Handler, ctx *gin.Context) { h.HandleHangup(ctx) })
+}
+
+func (s *relayServer) handleCodexSIPControl(c *gin.Context) {
+	s.codexRealtimeHandler(c, func(h *codexlive.Handler, ctx *gin.Context) { h.HandleSIPControl(ctx) })
 }
 
 func (s *relayServer) handleResponsesWebsocket(c *gin.Context) {
@@ -8496,6 +8741,8 @@ func main() {
 	}
 	baseHandlers := sdkhandlers.NewBaseAPIHandlers(sdkCfg, coreManager)
 	responsesHandler := sdkopenai.NewOpenAIResponsesAPIHandler(baseHandlers)
+	liveHandler := codexlive.NewHandler(coreManager, cfg)
+	defer liveHandler.Close()
 	relay := &relayServer{
 		runtime:            runtime,
 		cfg:                cfg,
@@ -8504,6 +8751,7 @@ func main() {
 		emitter:            emitter,
 		policy:             policy,
 		responsesWebsocket: responsesHandler.ResponsesWebsocket,
+		codexLive:          liveHandler,
 		quotaPoolStatePath: *quotaPoolStatePath,
 	}
 	if err := runRelayHTTPServer(ctx, cfg, wrapUnifiedGatewayHandler(m, relay.router()), emitter); err != nil && !errors.Is(err, context.Canceled) {

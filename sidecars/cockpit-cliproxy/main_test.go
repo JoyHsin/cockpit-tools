@@ -244,7 +244,7 @@ func TestCodexClientModelsResponsePreserves56Template(t *testing.T) {
 	if sol == nil {
 		t.Fatal("expected gpt-5.6-sol")
 	}
-	if intFromAny(sol["context_window"]) != 372000 || intFromAny(sol["max_context_window"]) != 372000 {
+	if intFromAny(sol["context_window"]) != 272000 || intFromAny(sol["max_context_window"]) != 921000 {
 		t.Fatalf("sol context windows = %#v / %#v", sol["context_window"], sol["max_context_window"])
 	}
 	if tiers, ok := sol["service_tiers"].([]any); !ok || len(tiers) != 1 {
@@ -3324,6 +3324,83 @@ func TestRelayServerResetAuthStateClearsSelectedAccountCooldown(t *testing.T) {
 	}
 }
 
+func TestRelayServerResetSchedulerStateAcceptsAPIKeyAccountWithoutAuthID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:         "api-auth-1",
+		Provider:   "codex",
+		Attributes: map[string]string{"api_key": "upstream-key"},
+		ModelStates: map[string]*coreauth.ModelState{
+			"gpt-5.5": {
+				Status:         coreauth.StatusError,
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(30 * time.Minute),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("register API-key auth: %v", err)
+	}
+	spec := &apiKeySpec{
+		ID:         "key_1",
+		Key:        "client-key",
+		Enabled:    true,
+		AccountIDs: []string{"api-account-1"},
+	}
+	account := &accountSpec{
+		ID:             "api-account-1",
+		AuthKind:       "api_key",
+		UpstreamAPIKey: "upstream-key",
+	}
+	m := &manifest{
+		APIKeys:       []apiKeySpec{*spec},
+		Accounts:      []accountSpec{*account},
+		apiKeyByValue: map[string]*apiKeySpec{"client-key": spec},
+		accountByID:   map[string]*accountSpec{"api-account-1": account},
+		accountByAPIKey: map[string]*accountSpec{
+			"upstream-key": account,
+		},
+	}
+	router := (&relayServer{
+		runtime:     &fakeRuntime{},
+		cfg:         &config.Config{},
+		manifest:    m,
+		authManager: manager,
+		policy:      &requestPolicy{manifest: m},
+	}).router()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/cockpit/accounts/reset-scheduler",
+		strings.NewReader(`{"accountIds":["api-account-1"]}`),
+	)
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	var payload struct {
+		Reset      int      `json:"reset"`
+		AccountIDs []string `json:"accountIds"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, w.Body.String())
+	}
+	if payload.Reset != 1 {
+		t.Fatalf("API-key auth scheduler state was not reset: %#v", payload)
+	}
+	if !reflect.DeepEqual(payload.AccountIDs, []string{"api-account-1"}) {
+		t.Fatalf("unexpected reset account ids: %#v", payload.AccountIDs)
+	}
+	updated, ok := manager.GetByID("api-auth-1")
+	if !ok || updated == nil || len(updated.ModelStates) != 0 || updated.Unavailable {
+		t.Fatalf("API-key auth state was not reset: %#v", updated)
+	}
+}
+
 func TestRelayServerFramesStreamingChatCompletionThroughRuntime(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	stream := make(chan cliproxyexecutor.StreamChunk, 2)
@@ -3928,6 +4005,62 @@ func TestRelayAcceptsResponsesPathAppendedToChatCompletionsBase(t *testing.T) {
 		if w.Code == http.StatusNotFound {
 			t.Fatalf("path %s should not be NoRoute 404 (got %d body=%s)", path, w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestRelayRegistersCodexLiveRoutesAndSkipsModelRewriting(t *testing.T) {
+	t.Parallel()
+	spec := &apiKeySpec{
+		ID:            "live-key",
+		Key:           "client-key",
+		Enabled:       true,
+		AllowedModels: []string{"gpt-5.6-sol"},
+	}
+	m := &manifest{
+		APIKeys:       []apiKeySpec{*spec},
+		ModelIDs:      []string{"gpt-5.6-sol"},
+		apiKeyByValue: map[string]*apiKeySpec{spec.Key: spec},
+	}
+	router := (&relayServer{
+		manifest: m,
+		policy:   &requestPolicy{manifest: m, tokenLimiter: newAPIKeyTokenLimiter(m)},
+	}).router()
+
+	unauthorized := httptest.NewRequest(http.MethodPost, "/v1/live", strings.NewReader(`{"model":"gpt-live-1-codex","sdp":"v=0"}`))
+	unauthorized.Header.Set("Content-Type", "application/json")
+	unauthorizedRecorder := httptest.NewRecorder()
+	router.ServeHTTP(unauthorizedRecorder, unauthorized)
+	if unauthorizedRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d; body=%s", unauthorizedRecorder.Code, http.StatusUnauthorized, unauthorizedRecorder.Body.String())
+	}
+
+	authorized := httptest.NewRequest(http.MethodPost, "/v1/live", strings.NewReader(`{"model":"gpt-live-1-codex","sdp":"v=0"}`))
+	authorized.Header.Set("Authorization", "Bearer "+spec.Key)
+	authorized.Header.Set("Content-Type", "application/json")
+	authorizedRecorder := httptest.NewRecorder()
+	router.ServeHTTP(authorizedRecorder, authorized)
+	if authorizedRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("authorized status = %d, want %d; body=%s", authorizedRecorder.Code, http.StatusServiceUnavailable, authorizedRecorder.Body.String())
+	}
+	if strings.Contains(authorizedRecorder.Body.String(), "model_not_available") {
+		t.Fatalf("live request was rejected by text model validation: %s", authorizedRecorder.Body.String())
+	}
+
+	sideband := httptest.NewRequest(http.MethodGet, "/v1/live/call-123", nil)
+	sideband.Header.Set("Authorization", "Bearer "+spec.Key)
+	sidebandRecorder := httptest.NewRecorder()
+	router.ServeHTTP(sidebandRecorder, sideband)
+	if sidebandRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("sideband status = %d, want %d; body=%s", sidebandRecorder.Code, http.StatusServiceUnavailable, sidebandRecorder.Body.String())
+	}
+
+	realtimeCall := httptest.NewRequest(http.MethodPost, "/v1/realtime/calls", strings.NewReader(`{"model":"gpt-live-1-codex","sdp":"v=0"}`))
+	realtimeCall.Header.Set("Authorization", "Bearer "+spec.Key)
+	realtimeCall.Header.Set("Content-Type", "application/json")
+	realtimeRecorder := httptest.NewRecorder()
+	router.ServeHTTP(realtimeRecorder, realtimeCall)
+	if realtimeRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("realtime call status = %d, want %d; body=%s", realtimeRecorder.Code, http.StatusServiceUnavailable, realtimeRecorder.Body.String())
 	}
 }
 
