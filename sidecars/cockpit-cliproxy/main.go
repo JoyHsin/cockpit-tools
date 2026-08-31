@@ -183,7 +183,7 @@ func main() {
 		codexLive:          liveHandler,
 		quotaPoolStatePath: *quotaPoolStatePath,
 	}
-	if err := runRelayHTTPServer(ctx, cfg, relay.router(), emitter); err != nil && !errors.Is(err, context.Canceled) {
+	if err := runRelayHTTPServer(ctx, cfg, wrapUnifiedGatewayHandler(m, relay.router()), emitter); err != nil && !errors.Is(err, context.Canceled) {
 		emitter.emit(map[string]any{"type": "error", "message": err.Error()})
 		os.Exit(1)
 	}
