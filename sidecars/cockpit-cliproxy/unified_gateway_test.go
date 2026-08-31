@@ -162,6 +162,43 @@ func TestUnifiedUnknownModelReturns404(t *testing.T) {
 	}
 }
 
+func TestUnifiedOfficialPassthroughWhenRouteNil(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstreamHit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	relay := &relayServer{
+		manifest: &manifest{
+			UnifiedGateway: &unifiedGatewayConfig{
+				Enabled:             true,
+				CapabilityToken:     "tok",
+				OfficialPassthrough: true,
+				OfficialUpstream:    server.URL,
+				Routes:              []unifiedGatewayRoute{},
+			},
+		},
+	}
+	router := gin.New()
+	router.Use(relay.unifiedGatewayMiddleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		relay.tryHandleUnifiedRequest(c, body, sdktranslator.FormatOpenAIResponse, "")
+	})
+	req := httptest.NewRequest(http.MethodPost, "/_cockpit-ugw/tok/v1/responses", bytes.NewReader([]byte(`{"model":"5.6 Terra"}`)))
+	req.Header.Set("Authorization", "Bearer valid-token-12345")
+	rec := httptest.NewRecorder()
+	wrapUnifiedGatewayHandler(relay.manifest, router).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !upstreamHit {
+		t.Fatalf("code=%d hit=%v body=%s", rec.Code, upstreamHit, rec.Body.String())
+	}
+}
+
 func TestUnifiedGatewayRewritesPathBeforeRouting(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	relay := &relayServer{
