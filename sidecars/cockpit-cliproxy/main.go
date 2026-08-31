@@ -116,6 +116,18 @@ func main() {
 		emitter.emit(map[string]any{"type": "error", "message": err.Error()})
 		os.Exit(2)
 	}
+	if m.unifiedGatewayEnabled() {
+		if secrets, err := readBrokerHandshake(os.Stdin); err != nil {
+			emitter.emit(map[string]any{"type": "error", "message": "unified gateway handshake failed"})
+			os.Exit(2)
+		} else if client, err := connectBroker(m.UnifiedGateway.BrokerSocket, secrets); err != nil {
+			emitter.emit(map[string]any{"type": "error", "message": "credential broker connect failed"})
+			os.Exit(2)
+		} else {
+			setGlobalBroker(client)
+			defer client.Close()
+		}
+	}
 	emitter.emitStartupStage("init_runtime")
 	quotaState := newQuotaReserveStateStore(*quotaReserveStatePath, m)
 	if err := quotaState.load(); err != nil {
