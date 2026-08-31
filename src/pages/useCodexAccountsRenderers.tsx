@@ -14,6 +14,7 @@ import { COCKPIT_API_BASE_URL } from "../utils/codexProviderPresets";
 import { formatCodexQuotaPoolPercent, formatCodexQuotaPoolWindowLabel } from "../utils/codexQuotaPool";
 import { resolveNewApiQuotaSnapshot } from "../services/modelProviderUsageService";
 import { CODEX_LOCAL_ACCESS_FALLBACK_API_KEY_MASK, formatCockpitApiInteger, formatCockpitApiTokenCount, getCockpitApiStatsRecord, getCockpitApiUsageRecord, getCodexAccountNoteTitle, hasCodexAccountNoteDetails, isPendingOAuthCodexAccount, isSponsorModelProvider, readCockpitApiNumber, readCockpitApiString, resolveApiKeyUsageMode, toCockpitApiRecord, type CockpitApiJsonRecord } from "./codexAccountsControllerModel";
+import { UnifiedGatewayStatusCard } from "../components/codex/UnifiedGatewayStatusCard";
 import type { useCodexAccountsBaseController } from "./useCodexAccountsBaseController";
 import type { useCodexAccountsOAuthController } from "./useCodexAccountsOAuthController";
 import type { useCodexAccountsAccessController } from "./useCodexAccountsAccessController";
@@ -1839,6 +1840,7 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
       }
   
       if (!activeGroupId && !groupByTag) {
+        cards.push(<UnifiedGatewayStatusCard key="unified-gateway-status" />);
         cards.push(
           ...codexGroups.map((group) => {
             const groupAccounts = resolveGroupAccounts(group);
