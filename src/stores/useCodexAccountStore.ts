@@ -106,7 +106,6 @@ type SwitchCodexAccountOptions = {
   reauthTokenGeneration?: number;
   reconcileAfterSwitch?: boolean;
   launchAfterSwitch?: boolean;
-  skipOfficialAccountCheck?: boolean;
 };
 
 interface CodexAccountState {
@@ -119,6 +118,7 @@ interface CodexAccountState {
   // Actions
   fetchAccounts: (options?: FetchCodexAccountsOptions) => Promise<void>;
   fetchCurrentAccount: (options?: FetchCodexCurrentAccountOptions) => Promise<void>;
+  applyAccountSnapshot: (account: CodexAccount) => void;
   switchAccount: (accountId: string, options?: SwitchCodexAccountOptions) => Promise<CodexAccount>;
   deleteAccount: (accountId: string) => Promise<void>;
   deleteAccounts: (accountIds: string[]) => Promise<void>;
@@ -208,6 +208,26 @@ export const useCodexAccountStore = create<CodexAccountState>((set, get) => ({
     }
   },
 
+  applyAccountSnapshot: (account: CodexAccount) => {
+    if (!account?.id) return;
+
+    // 授权/切号返回的账号是后端刚落盘的权威快照，先写入内存和 localStorage，
+    // 同时使旧的异步回读失效，避免旧结果把刚更新的状态覆盖回去。
+    invalidateCodexFetchRequests();
+    set((state) => {
+      const nextAccounts = mergeCodexAccountIntoList(state.accounts, account);
+      const nextCurrentAccount =
+        state.currentAccount?.id === account.id ? account : state.currentAccount;
+      persistCodexAccountsCache(nextAccounts);
+      persistCodexCurrentAccountCache(nextCurrentAccount);
+      return {
+        accounts: nextAccounts,
+        currentAccount: nextCurrentAccount,
+        error: null,
+      };
+    });
+  },
+
   switchAccount: async (accountId: string, options?: SwitchCodexAccountOptions) => {
     const flowStartedAt = performance.now();
     console.info('[Codex Switch][Store] switchAccount started', {
@@ -237,7 +257,6 @@ export const useCodexAccountStore = create<CodexAccountState>((set, get) => ({
       account = await codexService.switchCodexAccount(accountId, {
         reauthTokenGeneration: options?.reauthTokenGeneration,
         launchAfterSwitch: options?.launchAfterSwitch,
-        skipOfficialAccountCheck: options?.skipOfficialAccountCheck,
       });
     } catch (error) {
       // Token Authority 可能已把账号标记为 requires_reauth。立即回读账号库，
