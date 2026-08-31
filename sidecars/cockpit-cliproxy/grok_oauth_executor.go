@@ -414,13 +414,148 @@ func convertResponsesToChat(body []byte, model string, sourceFormat sdktranslato
 	body = expandCompactionItems(body)
 	if sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI) {
 		out := rewriteRequestModel(body, model)
-		return rewriteRequestStream(out, stream)
+		out = rewriteRequestStream(out, stream)
+		return sanitizeChatTools(out)
 	}
 	converted := responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(model, rewriteRequestModel(body, model), stream)
 	if len(bytes.TrimSpace(converted)) == 0 {
-		return fallbackResponsesToChatWithStream(body, model, stream)
+		return sanitizeChatTools(fallbackResponsesToChatWithStream(body, model, stream))
 	}
-	return converted
+	return sanitizeChatTools(converted)
+}
+
+func sanitizeChatTools(chatBody []byte) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(chatBody, &payload); err != nil || payload == nil {
+		return chatBody
+	}
+	toolsRaw, ok := payload["tools"].([]any)
+	if !ok || len(toolsRaw) == 0 {
+		return chatBody
+	}
+	sanitizedTools := make([]any, 0, len(toolsRaw))
+	for _, toolRaw := range toolsRaw {
+		toolMap, ok := toolRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		toolType, _ := toolMap["type"].(string)
+		if toolType != "function" {
+			sanitizedTools = append(sanitizedTools, toolMap)
+			continue
+		}
+		fnMap, ok := toolMap["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		fnCopy := make(map[string]any)
+		for k, v := range fnMap {
+			fnCopy[k] = v
+		}
+		paramsMap, _ := fnCopy["parameters"].(map[string]any)
+		if paramsMap == nil {
+			paramsMap = map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			}
+		} else {
+			paramsMap = sanitizeToolParametersSchema(paramsMap)
+		}
+		fnCopy["parameters"] = paramsMap
+		toolCopy := make(map[string]any)
+		for k, v := range toolMap {
+			toolCopy[k] = v
+		}
+		toolCopy["function"] = fnCopy
+		sanitizedTools = append(sanitizedTools, toolCopy)
+	}
+	payload["tools"] = sanitizedTools
+	next, err := json.Marshal(payload)
+	if err != nil {
+		return chatBody
+	}
+	return next
+}
+
+func sanitizeToolParametersSchema(params map[string]any) map[string]any {
+	out := make(map[string]any)
+	for k, v := range params {
+		out[k] = v
+	}
+
+	if anyOf, ok := out["anyOf"].([]any); ok && len(anyOf) > 0 {
+		picked := pickObjectBranchFromUnion(anyOf)
+		delete(out, "anyOf")
+		if picked != nil {
+			for k, v := range picked {
+				out[k] = v
+			}
+		}
+	}
+	if oneOf, ok := out["oneOf"].([]any); ok && len(oneOf) > 0 {
+		picked := pickObjectBranchFromUnion(oneOf)
+		delete(out, "oneOf")
+		if picked != nil {
+			for k, v := range picked {
+				out[k] = v
+			}
+		}
+	}
+
+	out["type"] = "object"
+
+	props, ok := out["properties"].(map[string]any)
+	if !ok || props == nil {
+		out["properties"] = map[string]any{}
+	} else {
+		sanitizedProps := make(map[string]any)
+		for pk, pv := range props {
+			if propMap, ok := pv.(map[string]any); ok {
+				sanitizedProps[pk] = sanitizePropertySchema(propMap)
+			} else {
+				sanitizedProps[pk] = pv
+			}
+		}
+		out["properties"] = sanitizedProps
+	}
+
+	return out
+}
+
+func pickObjectBranchFromUnion(branches []any) map[string]any {
+	for _, branch := range branches {
+		bMap, ok := branch.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, _ := bMap["type"].(string)
+		if t == "object" || bMap["properties"] != nil {
+			return bMap
+		}
+	}
+	return nil
+}
+
+func sanitizePropertySchema(prop map[string]any) map[string]any {
+	out := make(map[string]any)
+	for k, v := range prop {
+		out[k] = v
+	}
+	if types, ok := out["type"].([]any); ok && len(types) > 0 {
+		var firstType string
+		for _, t := range types {
+			if ts, ok := t.(string); ok && ts != "null" {
+				firstType = ts
+				break
+			}
+		}
+		if firstType != "" {
+			out["type"] = firstType
+		} else {
+			out["type"] = "string"
+		}
+	}
+	return out
 }
 
 func convertChatToResponsesRequest(body []byte, model string, stream bool) []byte {

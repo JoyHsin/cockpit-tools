@@ -367,3 +367,56 @@ func TestChatRequestConvertsToResponsesInput(t *testing.T) {
 		t.Fatalf("tools=%s", out)
 	}
 }
+
+func TestSanitizeChatToolsHandlesUnionSchemas(t *testing.T) {
+	input := []byte(`{
+		"model": "grok-4.5",
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "mcp__codex_app__automation_update",
+					"description": "test update",
+					"parameters": {
+						"anyOf": [
+							{
+								"type": "object",
+								"properties": {
+									"status": {
+										"type": ["string", "null"]
+									}
+								}
+							},
+							{
+								"type": "null"
+							}
+						]
+					}
+				}
+			}
+		]
+	}`)
+	sanitized := sanitizeChatTools(input)
+	var parsed map[string]any
+	if err := json.Unmarshal(sanitized, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := parsed["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools=%v", tools)
+	}
+	tool0, _ := tools[0].(map[string]any)
+	fn, _ := tool0["function"].(map[string]any)
+	params, _ := fn["parameters"].(map[string]any)
+	if params["type"] != "object" {
+		t.Fatalf("params type=%v", params["type"])
+	}
+	if _, ok := params["anyOf"]; ok {
+		t.Fatal("anyOf should have been removed")
+	}
+	props, _ := params["properties"].(map[string]any)
+	status, _ := props["status"].(map[string]any)
+	if status["type"] != "string" {
+		t.Fatalf("status type=%v", status["type"])
+	}
+}
