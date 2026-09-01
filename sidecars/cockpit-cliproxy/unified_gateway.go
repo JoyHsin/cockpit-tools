@@ -151,8 +151,16 @@ func unifiedRouteForModel(cfg *unifiedGatewayConfig, model string) *unifiedGatew
 		return nil
 	}
 	wanted := strings.TrimSpace(model)
+	if wanted == "" {
+		return nil
+	}
 	for i := range cfg.Routes {
 		if strings.EqualFold(strings.TrimSpace(cfg.Routes[i].ModelID), wanted) {
+			return &cfg.Routes[i]
+		}
+	}
+	for i := range cfg.Routes {
+		if strings.EqualFold(strings.TrimSpace(cfg.Routes[i].UpstreamModel), wanted) {
 			return &cfg.Routes[i]
 		}
 	}
@@ -232,9 +240,24 @@ func (s *relayServer) tryHandleUnifiedRequest(c *gin.Context, body []byte, sourc
 		return false
 	}
 	cfg := s.manifest.UnifiedGateway
+	if len(body) == 0 {
+		var err error
+		body, err = readAndRestoreBody(c.Request)
+		if err != nil {
+			writeAPIError(c, http.StatusBadRequest, "failed to read request body", "invalid_request")
+			return true
+		}
+	}
 	model := requestBodyModel(body)
+	if model == "" {
+		model = websocketEnvelopeModel(body)
+	}
 	route := unifiedRouteForModel(cfg, model)
 	if route == nil {
+		if cfg.OfficialPassthrough && officialAuthPresent(c.Request.Header) {
+			s.handleOfficialPassthrough(c, body, nil)
+			return true
+		}
 		writeAPIError(c, http.StatusNotFound, fmt.Sprintf("unknown model %s", model), "model_not_found")
 		return true
 	}

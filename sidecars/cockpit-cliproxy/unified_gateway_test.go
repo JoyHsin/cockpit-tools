@@ -162,6 +162,43 @@ func TestUnifiedUnknownModelReturns404(t *testing.T) {
 	}
 }
 
+func TestUnifiedOfficialPassthroughWhenRouteNil(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstreamHit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	relay := &relayServer{
+		manifest: &manifest{
+			UnifiedGateway: &unifiedGatewayConfig{
+				Enabled:             true,
+				CapabilityToken:     "tok",
+				OfficialPassthrough: true,
+				OfficialUpstream:    server.URL,
+				Routes:              []unifiedGatewayRoute{},
+			},
+		},
+	}
+	router := gin.New()
+	router.Use(relay.unifiedGatewayMiddleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		relay.tryHandleUnifiedRequest(c, body, sdktranslator.FormatOpenAIResponse, "")
+	})
+	req := httptest.NewRequest(http.MethodPost, "/_cockpit-ugw/tok/v1/responses", bytes.NewReader([]byte(`{"model":"5.6 Terra"}`)))
+	req.Header.Set("Authorization", "Bearer valid-token-12345")
+	rec := httptest.NewRecorder()
+	wrapUnifiedGatewayHandler(relay.manifest, router).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !upstreamHit {
+		t.Fatalf("code=%d hit=%v body=%s", rec.Code, upstreamHit, rec.Body.String())
+	}
+}
+
 func TestUnifiedGatewayRewritesPathBeforeRouting(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	relay := &relayServer{
@@ -328,5 +365,58 @@ func TestChatRequestConvertsToResponsesInput(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"name":"lookup"`) {
 		t.Fatalf("tools=%s", out)
+	}
+}
+
+func TestSanitizeChatToolsHandlesUnionSchemas(t *testing.T) {
+	input := []byte(`{
+		"model": "grok-4.5",
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "mcp__codex_app__automation_update",
+					"description": "test update",
+					"parameters": {
+						"anyOf": [
+							{
+								"type": "object",
+								"properties": {
+									"status": {
+										"type": ["string", "null"]
+									}
+								}
+							},
+							{
+								"type": "null"
+							}
+						]
+					}
+				}
+			}
+		]
+	}`)
+	sanitized := sanitizeChatTools(input)
+	var parsed map[string]any
+	if err := json.Unmarshal(sanitized, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := parsed["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools=%v", tools)
+	}
+	tool0, _ := tools[0].(map[string]any)
+	fn, _ := tool0["function"].(map[string]any)
+	params, _ := fn["parameters"].(map[string]any)
+	if params["type"] != "object" {
+		t.Fatalf("params type=%v", params["type"])
+	}
+	if _, ok := params["anyOf"]; ok {
+		t.Fatal("anyOf should have been removed")
+	}
+	props, _ := params["properties"].(map[string]any)
+	status, _ := props["status"].(map[string]any)
+	if status["type"] != "string" {
+		t.Fatalf("status type=%v", status["type"])
 	}
 }
