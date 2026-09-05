@@ -9,6 +9,28 @@
 ---
 ## [未发布]
 
+## [1.3.38] - 2026-09-05
+
+### 新增
+
+- **支持卸载 Claude Desktop 登录组件**：Claude 账号弹框现在可以删除本地下载的 Electron 登录 runtime 和未完成登录的临时 profile，释放磁盘空间，同时保留已保存的 Claude 账号。
+- **适配 GPT-6 Astra 模型**：在 API Service、账号切换、可见模型目录、唤醒预设和 Provider sidecar 中支持官方 `gpt-6-astra` 模型 ID 与 `GPT-6 Astra` 显示名称，并将它排在这些模型列表的第一位；同时补齐 105 万上下文、`max` 推理强度、Fast 档元数据和本地成本估算。仅增加可选模型，不改变默认模型。
+
+### 变更
+
+- **优化 Claude 登录组件缓存管理展示**：卸载区域改为独立的缓存卡片，显示实际占用空间并将说明、确认操作与按钮分层排列；空间统计在后台读取，不阻塞账号弹框打开。
+- **关闭可见模型目录后恢复官方模型可见性**：保存为关闭状态时会移除当前生效的 `model_catalog_json` 覆盖和 Cockpit 受管目录状态，但保留用户自己的目录文件；之后由官方 Codex 客户端根据账号权限决定可用模型。
+- **生成过验证码的 2FA 秘钥会自动保留到查询历史**：在 2FA 管理器或账号备注弹框输入有效秘钥后，只要能生成一次性验证码就立即加入近期查询，即使未保存账号备注直接关闭也可找回；查询历史不再自动淘汰超过 50 条的旧记录。
+
+### 修复
+
+- **修复 Claude Gateway 映射中的 1M 上下文复选框导致弹框错位的问题**：为自定义复选框建立独立的定位上下文，点击或勾选 1M 上下文后映射行和弹框内容保持稳定。（[#2229](https://github.com/jlcodes99/cockpit-tools/issues/2229)）
+- **修复混合模型路由被内部 `__provider_gateway__` 标识拒绝的问题**：不再把 Provider Gateway 内部绑定标识当作用户可配置的路由命名空间或账号 ID，使合法的 OAuth 订阅绑定和 API Key 路由可以正常保存并启动。（[#2222](https://github.com/jlcodes99/cockpit-tools/issues/2222)）
+- **修复 CodeBuddy 导入账号切换后的官方会话与国际版额度请求问题**：国际版 CodeBuddy 的计费请求补齐必要的 `User-Agent`，CodeBuddy、CodeBuddy CN 与 WorkBuddy 的 JSON 导入账号现在会保留 `expires_at`，避免切换到官方客户端后会话立即失效。（[#2194](https://github.com/jlcodes99/cockpit-tools/pull/2194)）
+- **修复 API Key 上游的 Responses Lite 请求兼容性**：规范化 API Service 发往 API Key 上游的 Responses Lite 请求头和工具调用参数，减少多轮请求被上游拒绝的情况。（[#2169](https://github.com/jlcodes99/cockpit-tools/pull/2169)）
+- **修复 Windows 工具栏按钮被拖拽层遮挡的问题**：窗口滚动后，顶部工具栏按钮仍可完整点击。（[#2187](https://github.com/jlcodes99/cockpit-tools/pull/2187)）
+- **修复 Codex API Service 在上游网络传输失败时错误冷却账号的问题**：DNS 失败、断网和连接被拒绝时仍可重试，不再修改账号或模型的冷却状态。
+
 ## [1.3.36] - 2026-09-02
 
 ### 新增

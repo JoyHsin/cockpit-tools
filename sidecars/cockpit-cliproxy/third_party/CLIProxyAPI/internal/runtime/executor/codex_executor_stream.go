@@ -22,6 +22,7 @@ import (
 )
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	opts.Headers = codexRequestHeadersWithGinResponsesLite(ctx, opts.Headers)
 	liteHeaderValue := ""
 	if opts.Headers != nil {
 		liteHeaderValue = headerValueCaseInsensitive(opts.Headers, codexResponsesLiteHeaderName)
@@ -115,6 +116,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if !useFullResponses && liteHeaderValue != "" {
 		httpReq.Header[codexResponsesLiteHeaderName] = []string{liteHeaderValue}
 	}
+	removeCodexResponsesLiteHeaderForAPIKey(httpReq.Header, auth)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID

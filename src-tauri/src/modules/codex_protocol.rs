@@ -245,13 +245,18 @@ pub fn apply_model_context_overrides(
 }
 
 fn apply_reasoning_effort_override(object: &mut Map<String, Value>, efforts: &[String]) {
-    let canonical_model = codex_client_model_template("gpt-5.6-sol").0;
-    let Some(levels) = canonical_model
+    let levels = object
         .get("supported_reasoning_levels")
         .and_then(Value::as_array)
-    else {
-        return;
-    };
+        .cloned()
+        .or_else(|| {
+            codex_client_model_template("gpt-5.6-sol")
+                .0
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default();
     let selected = efforts
         .iter()
         .filter_map(|effort| {
@@ -259,7 +264,6 @@ fn apply_reasoning_effort_override(object: &mut Map<String, Value>, efforts: &[S
                 .iter()
                 .find(|level| level.get("effort").and_then(Value::as_str) == Some(effort))
                 .cloned()
-                .or_else(|| Some(json!({"effort": effort})))
         })
         .collect::<Vec<_>>();
     if selected.is_empty() {
@@ -273,11 +277,17 @@ fn apply_reasoning_effort_override(object: &mut Map<String, Value>, efforts: &[S
         .get("default_reasoning_level")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if !efforts.iter().any(|effort| effort == current_default) {
-        if let Some(first) = efforts.first() {
+    if !selected.iter().any(|level| {
+        level.get("effort").and_then(Value::as_str) == Some(current_default)
+    }) {
+        if let Some(first) = selected
+            .first()
+            .and_then(|level| level.get("effort"))
+            .and_then(Value::as_str)
+        {
             object.insert(
                 "default_reasoning_level".to_string(),
-                Value::String(first.clone()),
+                Value::String(first.to_string()),
             );
         }
     }
@@ -290,7 +300,7 @@ pub(crate) fn managed_codex_model_ids() -> Vec<String> {
         .filter(|models| !models.is_empty())
         .or_else(|| catalog.get("models").and_then(Value::as_array));
 
-    models
+    let mut model_ids = models
         .into_iter()
         .flatten()
         .filter(|model| {
@@ -308,7 +318,17 @@ pub(crate) fn managed_codex_model_ids() -> Vec<String> {
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(str::to_string)
-        .collect()
+        .collect::<Vec<_>>();
+
+    if let Some(index) = model_ids
+        .iter()
+        .position(|model| model.eq_ignore_ascii_case("gpt-6-astra"))
+    {
+        let astra = model_ids.remove(index);
+        model_ids.insert(0, astra);
+    }
+
+    model_ids
 }
 
 pub fn normalize_responses_body_for_codex(body: &mut Value) -> bool {
@@ -603,6 +623,7 @@ fn display_name_for_model(model_id: &str) -> String {
         "gpt-5.4-mini" => "GPT-5.4 Mini".to_string(),
         "gpt-5.3-codex" => "GPT-5.3 Codex".to_string(),
         "gpt-5.3-codex-spark" => "GPT-5.3 Codex Spark".to_string(),
+        "gpt-6-astra" => "GPT-6 Astra".to_string(),
         "gpt-5.2" => "GPT-5.2".to_string(),
         "gpt-5.2-codex" => "GPT-5.2 Codex".to_string(),
         "gpt-5.1-codex-max" => "GPT-5.1 Codex Max".to_string(),
@@ -1261,7 +1282,12 @@ mod tests {
     fn codex_5_6_models_preserve_official_reasoning_and_speed_capabilities() {
         assert_eq!(
             managed_codex_model_ids(),
-            vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+            vec![
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna"
+            ]
         );
         let response = build_codex_client_models_response(&managed_codex_model_ids());
         let models = response
@@ -1326,6 +1352,80 @@ mod tests {
                 Some("freeform")
             );
         }
+    }
+
+    #[test]
+    fn gpt_6_astra_preserves_official_catalog_limits_and_reasoning_levels() {
+        let response = build_codex_client_models_response(&["gpt-6-astra".to_string()]);
+        let model = response
+            .pointer("/models/0")
+            .expect("Astra model should be present");
+        assert_eq!(
+            model.get("display_name").and_then(Value::as_str),
+            Some("GPT-6 Astra")
+        );
+        assert_eq!(
+            model.get("context_window").and_then(Value::as_i64),
+            Some(1_050_000)
+        );
+        assert_eq!(
+            model.get("max_context_window").and_then(Value::as_i64),
+            Some(1_050_000)
+        );
+        assert_eq!(
+            model.get("max_completion_tokens").and_then(Value::as_i64),
+            Some(128_000)
+        );
+        let efforts = model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .expect("Astra reasoning levels should exist")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(
+            model
+                .pointer("/service_tiers/0/description")
+                .and_then(Value::as_str),
+            Some("2x speed, increased usage")
+        );
+        assert_eq!(
+            model
+                .pointer("/additional_speed_tiers/0")
+                .and_then(Value::as_str),
+            Some("fast")
+        );
+        assert_eq!(
+            model.get("use_responses_lite").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn gpt_6_astra_filters_reasoning_efforts_to_official_five_levels() {
+        let response = build_codex_client_models_response_with_model_definitions_and_reasoning(&[
+            (
+                "gpt-6-astra".to_string(),
+                "GPT-6 Astra".to_string(),
+                Some(vec!["ultra".to_string(), "low".to_string(), "max".to_string()]),
+            ),
+        ]);
+        let model = response
+            .pointer("/models/0")
+            .expect("Astra model should be present");
+        let efforts = model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .expect("Astra reasoning levels should exist")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, vec!["low", "max"]);
+        assert_eq!(
+            model.get("default_reasoning_level").and_then(Value::as_str),
+            Some("low")
+        );
     }
 
     #[test]

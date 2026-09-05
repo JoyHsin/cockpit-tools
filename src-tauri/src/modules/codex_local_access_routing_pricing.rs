@@ -1065,6 +1065,12 @@ const fn codex_price(
 const CODEX_LOCAL_ACCESS_PRICE_BOOK: &[CodexLocalAccessPriceBookEntry] = &[
     // Keep in sync with supported Codex models and public OpenAI rates.
     CodexLocalAccessPriceBookEntry {
+        model_id: "gpt-6-astra",
+        session_long_context: true,
+        standard: codex_price(10.0, 1.0, 50.0),
+        priority: Some(codex_price(20.0, 2.0, 100.0)),
+    },
+    CodexLocalAccessPriceBookEntry {
         model_id: "gpt-5.6-sol",
         session_long_context: true,
         standard: codex_price(5.0, 0.5, 30.0),
@@ -1262,6 +1268,9 @@ fn normalize_known_openai_codex_model(model: &str) -> Option<String> {
         }
     }
 
+    if normalized.contains("gpt-6-astra") {
+        return Some("gpt-6-astra".to_string());
+    }
     if normalized.contains("gpt-5.6-sol") {
         return Some("gpt-5.6-sol".to_string());
     }
@@ -1353,6 +1362,7 @@ fn is_openai_session_long_context_model(model_id: &str) -> bool {
         normalized.as_str(),
         "gpt-5.4"
             | "gpt-5.5"
+            | "gpt-6-astra"
             | "gpt-5.6"
             | "gpt-5.6-sol"
             | "gpt-5.6-terra"
@@ -1853,4 +1863,3 @@ fn trim_recent_events(events: &mut Vec<CodexLocalAccessUsageEvent>, retention_si
     events.retain(|event| event.timestamp > 0 && event.timestamp >= retention_since);
     events.sort_by_key(|event| event.timestamp);
 }
-

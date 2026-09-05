@@ -9,6 +9,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ---
 ## [Unreleased]
 
+## [1.3.38] - 2026-09-05
+
+### Added
+
+- **Claude Desktop login component uninstall**: the Claude account dialog can now remove the locally downloaded Electron sign-in runtime and unfinished login profiles to free disk space without deleting saved Claude accounts.
+- **GPT-6 Astra model compatibility**: exposes the official `gpt-6-astra` model ID and `GPT-6 Astra` display name across the API Service, account switching, visible-model catalog, wakeup presets, and provider sidecars; it is listed first in those model lists, with the 1.05M context window, `max` reasoning effort, Fast-tier metadata, and local cost estimation. It remains opt-in at selection time and does not change the default model.
+
+### Changed
+
+- **Improved Claude sign-in component cache management**: the uninstall area is now a dedicated cache card that shows actual disk usage and separates the description, confirmation actions, and button layout; storage calculation runs in the background without blocking the account dialog.
+- **Disabling the visible-model catalog now restores official model visibility**: saving the setting off removes the active `model_catalog_json` override and Cockpit-managed catalog state, while leaving any user-owned catalog file untouched; the official Codex client then determines model availability from its own account permissions.
+- **Generated 2FA codes are retained in query history automatically**: entering a valid 2FA secret in the 2FA manager or an account-note dialog now adds it to recent queries as soon as a one-time code can be generated, even if the account note is closed without saving; query history is no longer automatically evicted after 50 entries.
+
+### Fixed
+
+- **Fixed Claude Gateway mapping dialogs becoming misaligned when toggling the 1M context checkbox**: the custom checkbox now has its own positioning context, keeping mapping rows and dialog content stable when the 1M option is clicked or enabled. ([#2229](https://github.com/jlcodes99/cockpit-tools/issues/2229))
+- **Fixed mixed model routing configurations being rejected by the internal `__provider_gateway__` identifier**: internal Provider Gateway binding markers are no longer treated as user-facing route namespaces or account IDs, allowing valid OAuth subscription bindings and API Key routes to be saved and launched successfully. ([#2222](https://github.com/jlcodes99/cockpit-tools/issues/2222))
+- **Fixed official-session and international quota-request issues for imported CodeBuddy accounts**: international CodeBuddy billing requests now include the required `User-Agent`, and JSON-imported CodeBuddy, CodeBuddy CN, and WorkBuddy accounts preserve `expires_at` so switching to the official client does not immediately invalidate the session. ([#2194](https://github.com/jlcodes99/cockpit-tools/pull/2194))
+- **Fixed Responses Lite compatibility for API Key upstreams**: API Service now normalizes the Responses Lite request headers and tool-call parameters sent to API Key upstreams, reducing upstream rejections in multi-turn requests. ([#2169](https://github.com/jlcodes99/cockpit-tools/pull/2169))
+- **Fixed Windows toolbar controls being covered by the drag layer**: toolbar buttons remain fully clickable after the window is scrolled. ([#2187](https://github.com/jlcodes99/cockpit-tools/pull/2187))
+- **Codex API Service no longer cools accounts for upstream transport failures**: DNS failures, offline connections, and connection-refused errors remain retryable without changing account or model cooldown state.
+
 ## [1.3.36] - 2026-09-02
 
 ### Added

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -1347,6 +1348,13 @@ func isConnectionLifecycleError(err error) bool {
 	if statusCodeFromError(err) != 0 {
 		return false
 	}
+	// Dial/DNS/TLS transport failures describe the upstream connection, not the
+	// credential. In particular, a local offline/DNS outage must not cool every
+	// account that happens to be tried while the network is unavailable.
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr != nil {
+		return true
+	}
 	// Client abort and request-scoped timeouts are not credential faults.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
@@ -1387,6 +1395,23 @@ func isConnectionLifecycleMessage(message string) bool {
 	// Wrapped transport EOF phrasing (e.g. "read tcp ...: unexpected EOF").
 	if strings.Contains(lower, "unexpected eof") {
 		return true
+	}
+	// Some transports lose their concrete net.Error while adding context. Keep
+	// the textual fallback limited to unambiguous transport-layer failures.
+	for _, pattern := range []string{
+		"no such host",
+		"network is unreachable",
+		"network unreachable",
+		"connection refused",
+		"connection reset by peer",
+		"connection aborted",
+		"i/o timeout",
+		"tls handshake timeout",
+		"dial tcp",
+	} {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
 	}
 	return false
 }

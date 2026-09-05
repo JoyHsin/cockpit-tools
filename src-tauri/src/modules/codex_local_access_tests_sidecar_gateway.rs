@@ -1604,6 +1604,18 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     }
 
     #[test]
+    fn provider_gateway_model_slots_keep_identity_for_gpt_6_astra() {
+        let slots = provider_gateway_model_slots(&["gpt-6-astra".to_string()]);
+        assert_eq!(
+            slots,
+            vec![super::ProviderGatewayModelSlot {
+                client_model: "gpt-6-astra".to_string(),
+                upstream_model: "gpt-6-astra".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn responses_sync_catalog_with_custom_models_requires_instance_gateway_but_remains_local_access_eligible(
     ) {
         let mut account = CodexAccount::new_api_key(

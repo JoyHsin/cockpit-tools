@@ -303,6 +303,44 @@ func TestCodexClientModelsResponsePreserves56Template(t *testing.T) {
 	}
 }
 
+func TestCodexClientModelsResponsePreservesAstraTemplate(t *testing.T) {
+	response := buildCodexClientModelsResponse([]string{"gpt-6-astra"}, &apiKeySpec{}, nil)
+	models, ok := response["models"].([]map[string]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("Astra models response = %#v, want one model", response["models"])
+	}
+	astra := models[0]
+	if got := stringFromAny(astra["display_name"]); got != "GPT-6 Astra" {
+		t.Fatalf("Astra display_name = %q", got)
+	}
+	if got := intFromAny(astra["context_window"]); got != 1050000 {
+		t.Fatalf("Astra context_window = %d, want 1050000", got)
+	}
+	if got := intFromAny(astra["max_context_window"]); got != 1050000 {
+		t.Fatalf("Astra max_context_window = %d, want 1050000", got)
+	}
+	levels, ok := astra["supported_reasoning_levels"].([]any)
+	if !ok {
+		t.Fatalf("Astra reasoning levels = %#v", astra["supported_reasoning_levels"])
+	}
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+		found := false
+		for _, raw := range levels {
+			level, _ := raw.(map[string]any)
+			if stringFromAny(level["effort"]) == effort {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("Astra reasoning levels missing %q: %#v", effort, levels)
+		}
+	}
+	if got := stringFromAny(astra["tool_mode"]); got != "code_mode_only" {
+		t.Fatalf("Astra tool_mode = %q", got)
+	}
+}
+
 func TestCodexClientModelsResponseAppliesExplicitContextWindows(t *testing.T) {
 	response := buildCodexClientModelsResponse(
 		[]string{"gpt-5.4", "gpt-5.6-sol", "custom-flash"},
@@ -2010,6 +2048,34 @@ func TestManifestRegistryModelsPreservesStaticThinkingSupport(t *testing.T) {
 	}
 	if info.UserDefined {
 		t.Fatalf("static model should not be marked user-defined: %#v", info)
+	}
+}
+
+func TestManifestRegistryModelsPreservesAstraThinkingSupport(t *testing.T) {
+	models := manifestRegistryModels(&manifest{
+		ModelIDs: []string{"gpt-6-astra"},
+	})
+	info := findModelInfoForTest(models, "gpt-6-astra")
+	if info == nil {
+		t.Fatal("expected gpt-6-astra in manifest registry models")
+	}
+	if info.Thinking == nil {
+		t.Fatalf("Astra thinking support is missing: %#v", info)
+	}
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+		found := false
+		for _, level := range info.Thinking.Levels {
+			if level == effort {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("Astra thinking levels missing %q: %#v", effort, info.Thinking.Levels)
+		}
+	}
+	if info.UserDefined {
+		t.Fatalf("Astra should use shipped static capabilities: %#v", info)
 	}
 }
 

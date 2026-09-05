@@ -1438,7 +1438,7 @@ func buildOllamaShowResponse(model string, modifiedAt time.Time) gin.H {
 
 func ollamaModelFamily(model string) string {
 	normalized := strings.ToLower(strings.TrimSpace(model))
-	for _, prefix := range []string{"gpt-5.6", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5.1", "gpt-oss", "codex"} {
+	for _, prefix := range []string{"gpt-6-astra", "gpt-5.6", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5.1", "gpt-oss", "codex"} {
 		if strings.HasPrefix(normalized, prefix) {
 			return prefix
 		}
@@ -1456,6 +1456,8 @@ func ollamaModelFamily(model string) string {
 
 func ollamaContextLength(model string) int {
 	switch {
+	case strings.HasPrefix(model, "gpt-6-astra"):
+		return 1050000
 	case strings.HasPrefix(model, "gpt-5.6"):
 		return 372000
 	case strings.HasPrefix(model, "gpt-5.5"), strings.HasPrefix(model, "gpt-5.4"):
@@ -1469,6 +1471,8 @@ func ollamaContextLength(model string) int {
 
 func ollamaReasoningEfforts(model string) []string {
 	switch {
+	case strings.HasPrefix(model, "gpt-6-astra"):
+		return []string{"low", "medium", "high", "xhigh", "max"}
 	case strings.HasPrefix(model, "gpt-5.6-sol"), strings.HasPrefix(model, "gpt-5.6-terra"):
 		return []string{"low", "medium", "high", "xhigh", "max", "ultra"}
 	case strings.HasPrefix(model, "gpt-5.6-luna"), strings.HasPrefix(model, "gpt-5.6"):
@@ -1683,6 +1687,8 @@ func displayNameForModel(model string) string {
 		return "GPT-5.6-Terra"
 	case "gpt-5.6-luna":
 		return "GPT-5.6-Luna"
+	case "gpt-6-astra":
+		return "GPT-6 Astra"
 	case "gpt-5.5":
 		return "GPT-5.5"
 	case "gpt-5.4":

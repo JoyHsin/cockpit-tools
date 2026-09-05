@@ -20,6 +20,7 @@ import (
 )
 
 func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	opts.Headers = codexRequestHeadersWithGinResponsesLite(ctx, opts.Headers)
 	if errPolicy := enforceCodexClientPolicy(auth, opts.Headers, req.Payload); errPolicy != nil {
 		return resp, errPolicy
 	}
@@ -93,6 +94,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, opts.Headers)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
 	removeCodexResponsesLiteHeaderForFullResponse(wsHeaders, useFullResponses)
+	removeCodexResponsesLiteHeaderForAPIKey(wsHeaders, auth)
 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	var authID, authLabel, authType, authValue string
