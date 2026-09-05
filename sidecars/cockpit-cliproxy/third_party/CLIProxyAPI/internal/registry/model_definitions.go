@@ -182,7 +182,7 @@ func codexBuiltinGPT6AstraModelInfo() *ModelInfo {
 		SupportedParameters:       []string{"tools"},
 		SupportedInputModalities:  []string{"text", "image"},
 		SupportedOutputModalities: []string{"text"},
-		Thinking:                  &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+		Thinking:                  &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
 	}
 }
 

@@ -1472,7 +1472,7 @@ func ollamaContextLength(model string) int {
 func ollamaReasoningEfforts(model string) []string {
 	switch {
 	case strings.HasPrefix(model, "gpt-6-astra"):
-		return []string{"low", "medium", "high", "xhigh", "max"}
+		return []string{"low", "medium", "high", "xhigh", "max", "ultra"}
 	case strings.HasPrefix(model, "gpt-5.6-sol"), strings.HasPrefix(model, "gpt-5.6-terra"):
 		return []string{"low", "medium", "high", "xhigh", "max", "ultra"}
 	case strings.HasPrefix(model, "gpt-5.6-luna"), strings.HasPrefix(model, "gpt-5.6"):

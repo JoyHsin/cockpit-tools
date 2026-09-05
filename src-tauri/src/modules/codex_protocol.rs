@@ -1383,7 +1383,10 @@ mod tests {
             .iter()
             .filter_map(|level| level.get("effort").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(
+            efforts,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
         assert_eq!(
             model
                 .pointer("/service_tiers/0/description")
@@ -1403,12 +1406,12 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_astra_filters_reasoning_efforts_to_official_five_levels() {
+    fn gpt_6_astra_filters_reasoning_efforts_to_official_six_levels() {
         let response = build_codex_client_models_response_with_model_definitions_and_reasoning(&[
             (
                 "gpt-6-astra".to_string(),
                 "GPT-6 Astra".to_string(),
-                Some(vec!["ultra".to_string(), "low".to_string(), "max".to_string()]),
+                Some(vec!["low".to_string(), "ultra".to_string(), "max".to_string()]),
             ),
         ]);
         let model = response
@@ -1421,7 +1424,7 @@ mod tests {
             .iter()
             .filter_map(|level| level.get("effort").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(efforts, vec!["low", "max"]);
+        assert_eq!(efforts, vec!["low", "ultra", "max"]);
         assert_eq!(
             model.get("default_reasoning_level").and_then(Value::as_str),
             Some("low")

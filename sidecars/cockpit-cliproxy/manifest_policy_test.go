@@ -323,7 +323,7 @@ func TestCodexClientModelsResponsePreservesAstraTemplate(t *testing.T) {
 	if !ok {
 		t.Fatalf("Astra reasoning levels = %#v", astra["supported_reasoning_levels"])
 	}
-	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max", "ultra"} {
 		found := false
 		for _, raw := range levels {
 			level, _ := raw.(map[string]any)
@@ -2062,7 +2062,7 @@ func TestManifestRegistryModelsPreservesAstraThinkingSupport(t *testing.T) {
 	if info.Thinking == nil {
 		t.Fatalf("Astra thinking support is missing: %#v", info)
 	}
-	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max", "ultra"} {
 		found := false
 		for _, level := range info.Thinking.Levels {
 			if level == effort {

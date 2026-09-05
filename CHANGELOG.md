@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ---
 ## [Unreleased]
 
+## [1.3.39] - 2026-09-05
+
+### Added
+
+- **GPT-6 Astra Ultra reasoning support**: Astra now advertises and accepts the `ultra` reasoning effort in the model capability catalog and API requests, matching the official client.
+
 ## [1.3.38] - 2026-09-05
 
 ### Added

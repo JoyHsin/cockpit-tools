@@ -998,6 +998,10 @@
         {
           "effort": "max",
           "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "effort": "ultra",
+          "description": "Highest reasoning depth for the most demanding problems"
         }
       ],
       "shell_type": "shell_command",

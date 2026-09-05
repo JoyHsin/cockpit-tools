@@ -1112,6 +1112,7 @@ fn normalize_proxy_reasoning_effort(value: &str) -> Option<&'static str> {
         "high" => Some("high"),
         "xhigh" | "x-high" | "extra_high" | "extrahigh" => Some("xhigh"),
         "max" => Some("max"),
+        "ultra" => Some("ultra"),
         _ => None,
     }
 }
