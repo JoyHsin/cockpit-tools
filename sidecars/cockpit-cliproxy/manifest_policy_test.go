@@ -2009,7 +2009,7 @@ func TestSidecarRuntimeRegistersManifestCodexAccessTokenAuths(t *testing.T) {
 		if auth == nil || !strings.EqualFold(auth.Provider, "codex") {
 			continue
 		}
-		if auth.Metadata != nil && auth.Metadata["access_token"] == "at-runtime-token" {
+		if auth.Metadata != nil && (auth.Metadata["access_token"] == "at-runtime-token" || auth.Metadata["personal_access_token"] == "at-runtime-token") {
 			tokenAuth = auth
 			break
 		}
