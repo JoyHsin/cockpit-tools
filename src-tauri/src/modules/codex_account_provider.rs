@@ -165,6 +165,7 @@ const SHIPPED_VISIBLE_CODEX_MODEL_IDS: &[&str] = &[
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.3-codex-spark",
+    "gpt-reserve",
 ];
 /// Official DeepSeek Codex setup writes `models.json` and points `model_catalog_json` at it.
 /// Extra instances must use their own CODEX_HOME copy, not the default `~/.codex/models.json`.
@@ -222,6 +223,7 @@ const CODEX_AUTH_PROJECTION_WRITER: &str = "cockpit";
 const CODEX_AUTH_PROJECTION_VERSION: u32 = 2;
 const CODEX_BATCH_IMPORT_SESSIONS_DIR: &str = "codex_batch_import_sessions";
 const CODEX_TOKEN_REFRESH_FILE_LOCK_TIMEOUT_SECONDS: u64 = 120;
+const CODEX_TOKEN_REFRESH_FILE_LOCK_FAST_TIMEOUT_SECONDS: u64 = 3;
 const CODEX_TOKEN_REFRESH_FILE_LOCK_STALE_SECONDS: u64 = 10 * 60;
 const CODEX_TOKEN_REFRESH_FILE_LOCK_POLL_MS: u64 = 100;
 const CODEX_PROFILE_MUTATION_LOCK_DIR: &str = ".cockpit-profile-mutation-locks";
@@ -785,15 +787,8 @@ fn normalize_deepseek_account(account: &mut CodexAccount) -> bool {
             changed = true;
         }
         let vision_model = "deepseek-v4-flash-vision-exp".to_string();
-        if account
-            .api_model_vision_support
-            .get(&vision_model)
-            .copied()
-            != Some(true)
-        {
-            account
-                .api_model_vision_support
-                .insert(vision_model, true);
+        if account.api_model_vision_support.get(&vision_model).copied() != Some(true) {
+            account.api_model_vision_support.insert(vision_model, true);
             changed = true;
         }
         if account.api_vision_routing_model.is_some() {

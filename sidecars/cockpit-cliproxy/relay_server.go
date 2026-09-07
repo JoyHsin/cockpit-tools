@@ -107,6 +107,7 @@ type quotaPoolAccountState struct {
 	Primary   *quotaPoolWindowState `json:"primary,omitempty"`
 	Secondary *quotaPoolWindowState `json:"secondary,omitempty"`
 	UpdatedAt *int64                `json:"updatedAt,omitempty"`
+	Cooldown  *quotaCooldownState   `json:"cooldown,omitempty"`
 }
 
 type quotaPoolStateFile struct {
@@ -243,6 +244,13 @@ func buildCockpitQuotaResponseWithAccounts(spec *apiKeySpec, state quotaPoolStat
 		}
 		primaryValue, primaryMinutes, primaryOK := quotaWindowValue(item.Primary)
 		secondaryValue, secondaryMinutes, secondaryOK := quotaWindowValue(item.Secondary)
+		// The API Service account view treats an exhausted weekly window as
+		// blocking the shorter window too. Keep the CDP quota endpoint on the
+		// same effective-quota semantics instead of exposing raw primary values
+		// such as 400% for a four-account pool.
+		if primaryOK && secondaryOK && secondaryValue == 0 {
+			primaryValue = 0
+		}
 		value, ok := 0, false
 		switch {
 		case primaryOK && secondaryOK && primaryMinutes <= secondaryMinutes:
@@ -466,6 +474,7 @@ func (s *relayServer) handleResetAuthState(c *gin.Context) {
 			resetAccountIDs = append(resetAccountIDs, target.accountID)
 		}
 	}
+	clearQuotaCooldownForAccounts(s.manifest, resetAccountIDs, time.Now())
 	c.JSON(http.StatusOK, gin.H{
 		"status":     "ok",
 		"reset":      len(resetAccountIDs),
@@ -561,6 +570,7 @@ func (s *relayServer) handleResetSchedulerState(c *gin.Context) {
 			resetAuthCount++
 		}
 	}
+	clearQuotaCooldownForAccounts(s.manifest, selected, time.Now())
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":         "ok",

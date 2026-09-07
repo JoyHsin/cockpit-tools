@@ -310,7 +310,7 @@ func TestCodexClientModelsResponsePreservesAstraTemplate(t *testing.T) {
 		t.Fatalf("Astra models response = %#v, want one model", response["models"])
 	}
 	astra := models[0]
-	if got := stringFromAny(astra["display_name"]); got != "GPT-6 Astra" {
+	if got := stringFromAny(astra["display_name"]); got != "6 Astra" {
 		t.Fatalf("Astra display_name = %q", got)
 	}
 	if got := intFromAny(astra["context_window"]); got != 1050000 {
@@ -562,6 +562,26 @@ func TestBuildCockpitQuotaResponseGroupsPlansAndPoolHealth(t *testing.T) {
 	}}, time.Now())
 	if response.AvailableAccountCount != 1 || response.AbnormalAccountCount != 1 || response.CooldownAccountCount != 1 {
 		t.Fatalf("runtime pool health = available %d, abnormal %d, cooldown %d", response.AvailableAccountCount, response.AbnormalAccountCount, response.CooldownAccountCount)
+	}
+}
+
+func TestBuildCockpitQuotaResponseBlocksHourlyWhenWeeklyIsExhausted(t *testing.T) {
+	present := true
+	fiveHourMinutes := int64(300)
+	weeklyMinutes := int64(10080)
+	state := quotaPoolStateFile{Accounts: map[string]quotaPoolAccountState{
+		"account-1": {
+			Primary:   &quotaPoolWindowState{Present: &present, RemainingPercent: intPtrForTest(100), WindowMinutes: &fiveHourMinutes},
+			Secondary: &quotaPoolWindowState{Present: &present, RemainingPercent: intPtrForTest(0), WindowMinutes: &weeklyMinutes},
+		},
+	}}
+
+	response := buildCockpitQuotaResponse(&apiKeySpec{AccountIDs: []string{"account-1"}}, state, time.Now())
+	if response.FiveHourRemainingPercent == nil || *response.FiveHourRemainingPercent != 0 {
+		t.Fatalf("five-hour percent = %#v, want 0 when weekly is exhausted", response.FiveHourRemainingPercent)
+	}
+	if response.WeeklyRemainingPercent == nil || *response.WeeklyRemainingPercent != 0 {
+		t.Fatalf("weekly percent = %#v, want 0", response.WeeklyRemainingPercent)
 	}
 }
 
@@ -854,8 +874,95 @@ func TestVisibleModelsForAPIKeyUsesPrefixAndFilters(t *testing.T) {
 
 	models := visibleModelsForAPIKey(m, spec)
 
-	if len(models) != 1 || models[0] != "team/gpt-5.4" {
+	if len(models) != 2 || models[0] != "team/gpt-5.4" || models[1] != "team/gpt-reserve" {
 		t.Fatalf("unexpected visible models: %#v", models)
+	}
+}
+
+func TestCodexReserveListingIsIndependentOfScopedAccountEligibility(t *testing.T) {
+	m := &manifest{
+		Accounts: []accountSpec{
+			{ID: "reserve-account", GPTReserveAllowed: true},
+			{ID: "ordinary-account", GPTReserveAllowed: false},
+		},
+		ModelIDs: []string{codexReserveModel, "gpt-5.4"},
+	}
+	reserveSpec := &apiKeySpec{AccountIDs: []string{"reserve-account"}}
+	ordinarySpec := &apiKeySpec{AccountIDs: []string{"ordinary-account"}}
+
+	if got := visibleModelsForAPIKey(m, reserveSpec); len(got) != 2 || got[0] != codexReserveModel {
+		t.Fatalf("entitled API key models = %#v, want reserve first", got)
+	}
+	if got := visibleModelsForAPIKey(m, ordinarySpec); len(got) != 2 || got[0] != codexReserveModel {
+		t.Fatalf("ordinary API key must still list Reserve: %#v", got)
+	}
+	if !validateClientModelVisible(m, reserveSpec, codexReserveModel, codexReserveModel) {
+		t.Fatal("entitled API key should accept gpt-reserve")
+	}
+	if !validateClientModelVisible(m, ordinarySpec, codexReserveModel, codexReserveModel) {
+		t.Fatal("model admission must not hide Reserve; account selection enforces eligibility")
+	}
+}
+
+func TestCodexReserveClientCatalogListsLunaReserveWithLunaCapabilities(t *testing.T) {
+	m := &manifest{
+		Accounts: []accountSpec{{ID: "reserve-account", GPTReserveAllowed: true}},
+		ModelIDs: []string{codexReserveModel},
+	}
+	models := clientCatalogModelsForAPIKey(m, &apiKeySpec{AccountIDs: []string{"reserve-account"}})
+	response := buildCodexClientModelsResponse(models, &apiKeySpec{}, nil)
+	data, ok := response["models"].([]map[string]any)
+	if !ok {
+		t.Fatalf("models response should contain a models array: %#v", response["models"])
+	}
+	reserve := findCodexClientModelForTest(data, codexReserveModel)
+	if reserve == nil || reserve["display_name"] != "Luna Reserve" || reserve["visibility"] != "list" {
+		t.Fatalf("gpt-reserve catalog entry = %#v", reserve)
+	}
+	lunaResponse := buildCodexClientModelsResponse([]string{"gpt-5.6-luna"}, &apiKeySpec{}, nil)
+	luna := findCodexClientModelForTest(lunaResponse["models"].([]map[string]any), "gpt-5.6-luna")
+	for _, field := range []string{"context_window", "max_context_window", "auto_compact_token_limit", "supported_reasoning_levels", "default_reasoning_level", "input_modalities", "tool_mode", "shell_type", "use_responses_lite", "priority"} {
+		if !reflect.DeepEqual(reserve[field], luna[field]) {
+			t.Fatalf("Reserve %s = %#v, want Luna value %#v", field, reserve[field], luna[field])
+		}
+	}
+	if reserve["auto_compact_token_limit"] != nil {
+		t.Fatal("Reserve must not force a compaction threshold")
+	}
+	info := manifestRegistryModelInfo(codexReserveModel, "", 0)
+	if !reflect.DeepEqual(info.Thinking, codexClientThinkingSupport("gpt-5.6-luna")) || info.Thinking == nil {
+		t.Fatalf("Reserve request reasoning capabilities = %#v", info.Thinking)
+	}
+}
+
+func TestReserveModelAdmissionKeepsIDAndStillHonorsExplicitAccessFilters(t *testing.T) {
+	m := &manifest{ModelIDs: []string{codexReserveModel, "gpt-5.6-luna"}}
+	spec := &apiKeySpec{AccountIDs: []string{"no-eligible-account"}}
+	body := []byte(`{"model":"gpt-reserve","input":"hello"}`)
+	rewritten, model, err := rewriteBodyModel(m, spec, body)
+	if err != nil || rewritten != nil || model != codexReserveModel {
+		t.Fatalf("Reserve must keep the original request unchanged: model=%q, err=%v", model, err)
+	}
+	spec.ExcludedModels = []string{codexReserveModel}
+	if validateClientModelVisible(m, spec, codexReserveModel, codexReserveModel) {
+		t.Fatal("persistent listing must not bypass an explicit API key model exclusion")
+	}
+	spec.ExcludedModels = nil
+	spec.AllowedModels = []string{"gpt-5.6-luna"}
+	if validateClientModelVisible(m, spec, codexReserveModel, codexReserveModel) {
+		t.Fatal("persistent listing must not bypass an explicit API key model allowlist")
+	}
+}
+
+func TestPrefixedCodexReserveKeepsVisibleLunaCapabilitiesAndExplicitContext(t *testing.T) {
+	spec := &apiKeySpec{ModelPrefix: "team"}
+	response := buildCodexClientModelsResponse([]string{"team/gpt-reserve"}, spec, map[string]int64{"gpt-reserve": 516000})
+	reserve := findCodexClientModelForTest(response["models"].([]map[string]any), "team/gpt-reserve")
+	if reserve == nil || reserve["visibility"] != "list" || reserve["display_name"] != "Luna Reserve" {
+		t.Fatalf("prefixed Reserve = %#v", reserve)
+	}
+	if intFromAny(reserve["context_window"]) != 516000 || reserve["auto_compact_token_limit"] != nil {
+		t.Fatalf("explicit Reserve context must not set compaction: %#v", reserve)
 	}
 }
 
@@ -871,7 +978,7 @@ func TestClientCatalogModelsIncludesAutoReviewWithoutPrefix(t *testing.T) {
 
 	models := clientCatalogModelsForAPIKey(m, spec)
 
-	if len(models) != 2 || models[0] != "team/gpt-5.4" || models[1] != codexAutoReviewModel {
+	if len(models) != 3 || models[0] != "team/gpt-5.4" || models[1] != "team/gpt-reserve" || models[2] != codexAutoReviewModel {
 		t.Fatalf("unexpected client catalog models: %#v", models)
 	}
 }
@@ -918,6 +1025,59 @@ func TestCockpitSelectorRestrictsAuthsToClientAPIKeyAccountScope(t *testing.T) {
 	}
 	if selected.ID != "account-scoped.json" {
 		t.Fatalf("expected only scoped account to be selected, got %q", selected.ID)
+	}
+}
+
+func TestCockpitSelectorUsesOnlyAccountsWithCodexReserveEntitlement(t *testing.T) {
+	highPlanOrdinary := &accountSpec{
+		ID:                "ordinary-account",
+		AuthID:            "ordinary-account.json",
+		PlanRank:          intPtrForTest(500),
+		GPTReserveAllowed: false,
+	}
+	reserveAccount := &accountSpec{
+		ID:                "reserve-account",
+		AuthID:            "reserve-account.json",
+		PlanRank:          intPtrForTest(300),
+		GPTReserveAllowed: true,
+	}
+	selector := &cockpitSelector{
+		manifest: &manifest{
+			RoutingStrategy: "auto",
+			Accounts:        []accountSpec{*highPlanOrdinary, *reserveAccount},
+			accountByAuthID: map[string]*accountSpec{
+				"ordinary-account.json": highPlanOrdinary,
+				"reserve-account.json":  reserveAccount,
+			},
+			accountByID: map[string]*accountSpec{
+				"ordinary-account": highPlanOrdinary,
+				"reserve-account":  reserveAccount,
+			},
+		},
+	}
+	auths := []*coreauth.Auth{
+		{ID: "ordinary-account.json", Provider: "codex", Status: coreauth.StatusActive},
+		{ID: "reserve-account.json", Provider: "codex", Status: coreauth.StatusActive},
+	}
+
+	selected, err := selector.Pick(context.Background(), "codex", codexReserveModel, cliproxyexecutor.Options{}, auths)
+
+	if err != nil {
+		t.Fatalf("pick gpt-reserve auth: %v", err)
+	}
+	if selected == nil || selected.ID != "reserve-account.json" {
+		t.Fatalf("selected auth = %#v, want entitled account", selected)
+	}
+	ctx := context.WithValue(context.Background(), clientAPIKeyContextKey, &apiKeySpec{
+		ID: "ordinary-only", AccountIDs: []string{"ordinary-account"},
+	})
+	selected, err = selector.Pick(ctx, "codex", codexReserveModel, cliproxyexecutor.Options{}, auths)
+	if err == nil || selected != nil {
+		t.Fatal("must not use an out-of-scope entitled account or an ineligible scoped account")
+	}
+	selected, err = selector.Pick(context.Background(), "codex", codexReserveModel, cliproxyexecutor.Options{}, auths[:1])
+	if err == nil || selected != nil {
+		t.Fatal("an ordinary-only pool must fail instead of routing Reserve to an ordinary account")
 	}
 }
 
@@ -2827,8 +2987,47 @@ func TestVisibleModelsForMixedRoutingIncludesNamespacedProviderModels(t *testing
 	}}
 
 	got := visibleModelsForAPIKey(m, spec)
-	want := []string{"gpt-5.5", "cpa/gpt-5.5", "cpa/grok-4.6"}
+	want := []string{"gpt-5.5", "gpt-reserve", "cpa/gpt-5.5", "cpa/grok-4.6"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("visible models = %#v, want %#v", got, want)
+	}
+}
+
+func TestAccountQuotaExhaustedOnlyBlocksKnownOAuthZeroQuota(t *testing.T) {
+	zero := 0
+	positive := 12
+	if !accountQuotaExhausted(nil, &accountSpec{AuthKind: "oauth", RemainingQuota: &zero}, time.Now()) {
+		t.Fatal("known zero OAuth quota should be exhausted")
+	}
+	if accountQuotaExhausted(nil, &accountSpec{AuthKind: "oauth", RemainingQuota: &positive}, time.Now()) {
+		t.Fatal("positive OAuth quota should remain available")
+	}
+	if accountQuotaExhausted(nil, &accountSpec{AuthKind: "oauth"}, time.Now()) {
+		t.Fatal("unknown OAuth quota should not be treated as exhausted")
+	}
+	if accountQuotaExhausted(nil, &accountSpec{AuthKind: "api_key", RemainingQuota: &zero}, time.Now()) {
+		t.Fatal("API-key accounts must use their own quota policy")
+	}
+}
+
+func TestCockpitSelectorSkipsExhaustedQuotaForRegularModels(t *testing.T) {
+	zero := 0
+	account := &accountSpec{ID: "account-1", AuthKind: "oauth", RemainingQuota: &zero, GPTReserveAllowed: true}
+	auth := &coreauth.Auth{ID: "auth-1", Provider: "codex"}
+	m := &manifest{
+		ModelIDs:       []string{"gpt-5.5", codexReserveModel},
+		Accounts:       []accountSpec{*account},
+		accountByAuthID: map[string]*accountSpec{"auth-1": account},
+	}
+	selector := &cockpitSelector{manifest: m}
+
+	selected, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, []*coreauth.Auth{auth})
+	if selected != nil || err == nil {
+		t.Fatalf("regular model should be blocked by zero quota: selected=%v err=%v", selected, err)
+	}
+
+	selected, err = selector.Pick(context.Background(), "codex", codexReserveModel, cliproxyexecutor.Options{}, []*coreauth.Auth{auth})
+	if err != nil || selected != auth {
+		t.Fatalf("reserve model should keep its independent quota path: selected=%v err=%v", selected, err)
 	}
 }

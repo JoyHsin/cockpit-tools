@@ -1,6 +1,200 @@
 // Codex 账号测试：Quick config, provider validation and index repair behavior。
 // 测试与生产实现共享 super 作用域，验证真实持久化和运行态行为。
     #[test]
+    fn managed_catalog_lists_reserve_without_changing_defaults_and_cleans_up_when_disabled() {
+        let base_dir = make_temp_dir("codex-reserve-managed-catalog");
+        fs::write(base_dir.join("config.toml"), "model = \"gpt-5.6-sol\"\n")
+            .expect("write original model");
+        let definitions = super::default_experimental_model_definitions(&base_dir);
+        assert!(definitions.iter().any(|model| model.model_id == "gpt-reserve"));
+        let saved = super::save_model_catalog_for_base_dir_preserving_context(
+            &base_dir, true, definitions.clone(), Some("gpt-5.6-sol".to_string()),
+        ).expect("save managed catalog");
+        assert!(saved.experimental_model_catalog_models.iter()
+            .any(|model| model.model_id == "gpt-reserve"));
+        let catalog: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(base_dir.join(super::CODEX_MANAGED_MODEL_CATALOG_FILE)).unwrap()
+        ).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        let reserve = models.iter().find(|model| model["slug"] == "gpt-reserve").unwrap();
+        let luna = models.iter().find(|model| model["slug"] == "gpt-5.6-luna").unwrap();
+        assert_eq!(reserve["visibility"], "list");
+        assert_eq!(reserve["display_name"], "Luna Reserve");
+        assert_eq!(reserve["context_window"], luna["context_window"]);
+        assert_eq!(reserve["supported_reasoning_levels"], luna["supported_reasoning_levels"]);
+        assert!(reserve["auto_compact_token_limit"].is_null());
+        let config = fs::read_to_string(base_dir.join("config.toml")).unwrap();
+        assert!(config.contains("model = \"gpt-5.6-sol\""));
+        assert!(!config.contains("model_context_window"));
+        assert!(!config.contains("model_auto_compact_token_limit"));
+
+        super::save_model_catalog_for_base_dir_preserving_context(
+            &base_dir, false, definitions, None,
+        ).expect("disable managed catalog");
+        let config = fs::read_to_string(base_dir.join("config.toml")).unwrap();
+        assert!(!config.contains("model_catalog_json"));
+        assert!(!base_dir.join(super::CODEX_MANAGED_MODEL_CATALOG_FILE).exists());
+        assert!(config.contains("model = \"gpt-5.6-sol\""));
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn quick_config_migrates_legacy_astra_display_name_in_managed_catalog_and_cache() {
+        let base_dir = make_temp_dir("codex-astra-display-name-migration-test");
+        fs::write(
+            base_dir.join("config.toml"),
+            "model_catalog_json = \"cockpit-model-catalog.json\"\nmodel = \"gpt-6-astra\"\n",
+        )
+        .expect("write config");
+        fs::write(
+            base_dir.join(super::CODEX_EXPERIMENTAL_MODEL_POLICY_FILE),
+            "enabled\n",
+        )
+        .expect("enable managed catalog");
+        fs::write(
+            base_dir.join(super::CODEX_MANAGED_MODEL_CATALOG_FILE),
+            r#"{"models":[{"slug":"gpt-6-astra","display_name":"GPT-6 Astra","description":"GPT-6 Astra","visibility":"list"},{"slug":"custom-model","display_name":"GPT-6 Astra","description":"GPT-6 Astra"}]}"#,
+        )
+        .expect("write legacy managed catalog");
+        fs::write(
+            base_dir.join(super::CODEX_EXPERIMENTAL_MODEL_CONFIG_FILE),
+            r#"{"version":4,"models":[{"model_id":"gpt-6-astra","display_name":"GPT-6 Astra"}],"migrations":["add-gpt-6-astra-model"]}"#,
+        )
+        .expect("write legacy model cache");
+
+        let quick_config =
+            read_quick_config_from_config_toml(&base_dir).expect("read migrated quick config");
+        assert_eq!(
+            quick_config
+                .experimental_model_catalog_models
+                .iter()
+                .find(|model| model.model_id == "gpt-6-astra")
+                .map(|model| model.display_name.as_str()),
+            Some("6 Astra")
+        );
+
+        let catalog: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(base_dir.join(super::CODEX_MANAGED_MODEL_CATALOG_FILE))
+                .expect("read migrated managed catalog"),
+        )
+        .expect("parse migrated managed catalog");
+        let astra = catalog["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .find(|model| model["slug"] == "gpt-6-astra")
+            .expect("Astra model");
+        assert_eq!(astra["display_name"], "6 Astra");
+        assert_eq!(astra["description"], "6 Astra");
+        let custom = catalog["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .find(|model| model["slug"] == "custom-model")
+            .expect("custom model");
+        assert_eq!(custom["display_name"], "GPT-6 Astra");
+
+        let cache: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(base_dir.join(super::CODEX_EXPERIMENTAL_MODEL_CONFIG_FILE))
+                .expect("read migrated model cache"),
+        )
+        .expect("parse migrated model cache");
+        assert_eq!(cache["models"][0]["display_name"], "6 Astra");
+        assert!(cache["migrations"]
+            .as_array()
+            .expect("migrations")
+            .iter()
+            .any(|migration| migration == super::GPT_6_ASTRA_DISPLAY_NAME_MIGRATION_ID));
+
+        read_quick_config_from_config_toml(&base_dir).expect("read migrated config again");
+        let cache_after = fs::read_to_string(base_dir.join(super::CODEX_EXPERIMENTAL_MODEL_CONFIG_FILE))
+            .expect("read stable model cache");
+        assert_eq!(cache_after, serde_json::to_string_pretty(&cache).unwrap() + "\n");
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn context_management_defaults_to_off_without_creating_config() {
+        let base_dir = make_temp_dir("codex-context-management-default-test");
+
+        let config = super::read_quick_config_from_config_toml(&base_dir)
+            .expect("read missing config");
+        assert!(!config.context_management_experimental_mode);
+        super::save_context_management_for_base_dir(&base_dir, false)
+            .expect("keep the official default disabled");
+        assert!(!base_dir.join("config.toml").exists());
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn context_management_only_changes_its_own_official_feature_key() {
+        let base_dir = make_temp_dir("codex-context-management-write-test");
+        let config_path = base_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "model = \"gpt-5.6-sol\"\nmodel_context_window = 516000\n\n[features]\nmemories = true\n\n[other]\nvalue = \"keep\"\n",
+        )
+        .expect("write config");
+
+        let enabled = super::save_context_management_for_base_dir(&base_dir, true)
+            .expect("enable context management");
+        assert!(enabled.context_management_experimental_mode);
+        let content = fs::read_to_string(&config_path).expect("read enabled config");
+        assert!(content.contains("model = \"gpt-5.6-sol\""));
+        assert!(content.contains("model_context_window = 516000"));
+        assert!(content.contains("memories = true"));
+        assert!(content.contains("value = \"keep\""));
+        assert!(content.contains("experimental_mode = true"));
+
+        let disabled = super::save_context_management_for_base_dir(&base_dir, false)
+            .expect("disable context management");
+        assert!(!disabled.context_management_experimental_mode);
+        let content = fs::read_to_string(&config_path).expect("read disabled config");
+        assert!(!content.contains("experimental_mode"));
+        assert!(content.contains("memories = true"));
+        assert!(content.contains("value = \"keep\""));
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn context_management_preserves_inline_features_when_toggled() {
+        let base_dir = make_temp_dir("codex-context-management-inline-test");
+        let config_path = base_dir.join("config.toml");
+        fs::write(&config_path, "model = \"gpt-5\"\nfeatures = { memories = true }\n")
+            .expect("write inline config");
+
+        super::save_context_management_for_base_dir(&base_dir, true)
+            .expect("enable inline context management");
+        let content = fs::read_to_string(&config_path).expect("read inline config");
+        let document = content.parse::<toml_edit::Document>().expect("parse inline config");
+        assert_eq!(document["features"]["memories"].as_bool(), Some(true));
+        assert_eq!(
+            document["features"]["context_management"]["experimental_mode"].as_bool(),
+            Some(true)
+        );
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn context_management_rejects_invalid_feature_shape_without_overwriting_it() {
+        let base_dir = make_temp_dir("codex-context-management-invalid-shape-test");
+        let config_path = base_dir.join("config.toml");
+        let original = "model = \"gpt-5\"\nfeatures = false\n";
+        fs::write(&config_path, original).expect("write invalid config");
+
+        let error = super::save_context_management_for_base_dir(&base_dir, true)
+            .expect_err("invalid features should be rejected");
+        assert!(error.contains("features 不是合法表结构"));
+        assert_eq!(fs::read_to_string(&config_path).expect("read invalid config"), original);
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn quick_config_reads_custom_context_window_without_hiding_it() {
         let base_dir = make_temp_dir("codex-quick-config-custom-window-test");
         let config_path = base_dir.join("config.toml");
@@ -465,7 +659,15 @@
         )
         .expect("enable dynamic experimental catalog");
 
-        assert_eq!(result.experimental_model_catalog_models, models);
+        let mut expected = models.clone();
+        expected.push(CodexExperimentalModelDefinition {
+            model_id: "gpt-reserve".to_string(),
+            display_name: "Luna Reserve".to_string(),
+            reasoning_efforts: None,
+            context_window: None,
+            auto_compact_token_limit: None,
+        });
+        assert_eq!(result.experimental_model_catalog_models, expected);
         let config = fs::read_to_string(base_dir.join("config.toml")).expect("read config");
         assert!(!config.contains("model = \"custom-model-a\""));
         let catalog: serde_json::Value = serde_json::from_str(
@@ -589,7 +791,15 @@
         )
         .expect("persist visible model list");
 
-        assert_eq!(result.experimental_model_catalog_models, models);
+        let mut expected = models.clone();
+        expected.push(CodexExperimentalModelDefinition {
+            model_id: "gpt-reserve".to_string(),
+            display_name: "Luna Reserve".to_string(),
+            reasoning_efforts: None,
+            context_window: None,
+            auto_compact_token_limit: None,
+        });
+        assert_eq!(result.experimental_model_catalog_models, expected);
         assert_eq!(
             result
                 .experimental_model_catalog_default_model_id

@@ -33,6 +33,7 @@
             Some("unauthorized")
         );
         assert!(super::sidecar_scheduler_blocks_account(Some(health), now));
+        assert!(super::account_health_blocks_dispatch(Some(health), now));
         assert_eq!(runtime.model_cooldowns.len(), 1);
     }
 
@@ -93,6 +94,7 @@
             Some(health),
             later
         ));
+        assert!(!super::account_health_blocks_dispatch(Some(health), later));
         assert!(runtime.model_cooldowns.is_empty());
     }
 
@@ -155,6 +157,29 @@
     }
 
     #[test]
+    fn manual_recovery_removes_only_selected_pool_member_status() {
+        let mut runtime = super::GatewayRuntime::default();
+        let mut pool = super::RuntimeAccountPoolHealth::default();
+        pool.account_statuses = vec![
+            super::RuntimeAccountPoolMemberHealth {
+                account_id: "account-1".to_string(),
+                ..Default::default()
+            },
+            super::RuntimeAccountPoolMemberHealth {
+                account_id: "account-2".to_string(),
+                ..Default::default()
+            },
+        ];
+        runtime.account_pool_health.insert("key-1".to_string(), pool);
+
+        super::clear_runtime_account_health(&mut runtime, &["account-1".to_string()]);
+
+        let remaining = &runtime.account_pool_health["key-1"].account_statuses;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].account_id, "account-2");
+    }
+
+    #[test]
     fn manual_recovery_clears_only_selected_runtime_account_health() {
         let mut runtime = super::GatewayRuntime::default();
         runtime.account_health.insert(
@@ -183,7 +208,124 @@
         assert!(!runtime.account_health.contains_key("account-1"));
         assert!(runtime.account_health.contains_key("account-2"));
         assert!(runtime.model_cooldowns.is_empty());
-        assert!(runtime.account_pool_health.is_empty());
+        assert!(runtime.account_pool_health.contains_key("key-1"));
+    }
+
+    #[test]
+    fn quota_exhaustion_blocks_dispatch_until_reset_or_recovery() {
+        let mut runtime = super::GatewayRuntime::default();
+        runtime.account_quota_cooldowns.insert(
+            "account-1".to_string(),
+            super::AccountQuotaCooldown {
+                exhausted: true,
+                reset_at_ms: Some(2_000_000),
+                updated_at_ms: 1_000_000,
+            },
+        );
+
+        assert!(super::account_recovery_blocked_by_quota(&runtime, "account-1", 1_500_000));
+        assert!(!super::account_recovery_blocked_by_quota(&runtime, "account-1", 2_000_000));
+
+        super::mark_quota_cooldowns_recovered(
+            &mut runtime,
+            &["account-1".to_string()],
+            1_750_000,
+        );
+        assert!(!super::account_recovery_blocked_by_quota(&runtime, "account-1", 1_800_000));
+        let recovered = runtime.account_quota_cooldowns.get("account-1").expect("recovered snapshot");
+        assert!(!recovered.active(1_800_000));
+        assert_eq!(recovered.updated_at_ms, 1_750_000);
+    }
+
+    #[test]
+    fn removing_accounts_clears_runtime_health_and_quota_cooldown() {
+        let mut runtime = super::GatewayRuntime::default();
+        runtime.account_health.insert(
+            "account-1".to_string(),
+            super::RuntimeAccountHealth::default(),
+        );
+        runtime.account_quota_cooldowns.insert(
+            "account-1".to_string(),
+            super::AccountQuotaCooldown {
+                exhausted: true,
+                reset_at_ms: None,
+                updated_at_ms: 1_000_000,
+            },
+        );
+        runtime.account_quota_cooldowns.insert(
+            "account-2".to_string(),
+            super::AccountQuotaCooldown {
+                exhausted: true,
+                reset_at_ms: None,
+                updated_at_ms: 1_000_000,
+            },
+        );
+
+        super::clear_runtime_account_health(&mut runtime, &["account-1".to_string()]);
+        super::clear_runtime_quota_cooldowns(&mut runtime, &["account-1".to_string()]);
+
+        assert!(!runtime.account_health.contains_key("account-1"));
+        assert!(!runtime.account_quota_cooldowns.contains_key("account-1"));
+        assert!(runtime.account_quota_cooldowns.contains_key("account-2"));
+    }
+
+    fn oauth_account_with_quota(
+        hourly: i32,
+        weekly: i32,
+        raw_data: Option<serde_json::Value>,
+    ) -> CodexAccount {
+        let mut account = test_account_with_plan("free");
+        account.quota = Some(crate::models::codex::CodexQuota {
+            hourly_percentage: hourly,
+            hourly_reset_time: None,
+            hourly_window_minutes: None,
+            hourly_window_present: Some(true),
+            weekly_percentage: weekly,
+            weekly_reset_time: None,
+            weekly_window_minutes: None,
+            weekly_window_present: Some(true),
+            reset_credits_available: None,
+            reset_credits: Vec::new(),
+            reset_credits_next_expires_at: None,
+            raw_data,
+        });
+        account.usage_updated_at = Some(1_700);
+        account
+    }
+
+    #[test]
+    fn remaining_credits_keep_zero_window_accounts_out_of_quota_cooldown() {
+        let now = 1_800_000_i64;
+        let credit_account = oauth_account_with_quota(
+            0,
+            0,
+            Some(serde_json::json!({
+                "credits": { "balance": "351.02", "remaining": 351.02, "unlimited": false }
+            })),
+        );
+        let cooldown = super::account_quota_cooldown(&credit_account, now)
+            .expect("credit account should produce a cooldown snapshot");
+        assert!(!cooldown.exhausted);
+        assert_eq!(super::resolve_remaining_quota(&credit_account), Some(1));
+
+        let spend_control_account = oauth_account_with_quota(
+            0,
+            0,
+            Some(serde_json::json!({
+                "spend_control": {
+                    "individual_limit": { "limit": "400", "used": "48.98", "remaining": "351.02" }
+                }
+            })),
+        );
+        let spend_cooldown = super::account_quota_cooldown(&spend_control_account, now)
+            .expect("spend-control credits should keep the account schedulable");
+        assert!(!spend_cooldown.exhausted);
+
+        let exhausted_account = oauth_account_with_quota(0, 0, None);
+        let exhausted = super::account_quota_cooldown(&exhausted_account, now)
+            .expect("zero windows without credits should be exhausted");
+        assert!(exhausted.exhausted);
+        assert_eq!(super::resolve_remaining_quota(&exhausted_account), Some(0));
     }
 
     #[test]
@@ -479,6 +621,7 @@
         build_model_provider_gateway_test_collection, build_ordered_account_ids,
         build_request_routing_hint, build_runtime_account, build_upstream_websocket_url,
         calculate_usage_cost_usd, calendar_stats_window_starts, canonical_model_for_client_model,
+        account_has_gpt_reserve_entitlement,
         classify_upstream_error_category, cleanup_profile_takeover_without_backup,
         cleanup_provider_gateway_profile_model_overrides, codex_price,
         collect_local_access_profile_takeover_dirs_from_store, compare_routing_candidates,
@@ -545,6 +688,7 @@
         ParsedRequest, ResolvedLocalApiKey, ResponseUsageCollector, RoutingCandidate,
         SidecarUsageDetails, SidecarUsageEvent, UsageCapture,
         BOUND_OAUTH_QUOTA_RESERVE_MAX_SNAPSHOT_AGE_SECONDS, CODEX_AUTO_REVIEW_MODEL_ID,
+        CODEX_GPT_RESERVE_MODEL_ID,
         CODEX_IMAGEGEN_ACTOR_HEADER, CODEX_IMAGE_MODEL_ID,
         CODEX_LEGACY_LOCAL_ACCESS_MODEL_CATALOG_FILE, CODEX_LEGACY_PROVIDER_MODEL_CATALOG_FILE,
         CODEX_LOCAL_ACCESS_DISABLE_HOSTED_IMAGE_GENERATION_HEADER,
@@ -848,6 +992,7 @@
             HashMap::new(),
             None,
             HashMap::new(),
+            true,
             Some(super::GatewayPreparationContext {
                 generation: current_generation.wrapping_add(1),
                 total: 1,
@@ -2663,6 +2808,118 @@ http_headers = { "x-cockpit-instance-id" = "default" }
     }
 
     #[test]
+    fn gpt_reserve_entitlement_requires_an_allowed_additional_rate_limit() {
+        let mut account = test_account_with_plan("pro");
+        account.quota = Some(CodexQuota {
+            hourly_percentage: 100,
+            hourly_reset_time: None,
+            hourly_window_minutes: Some(300),
+            hourly_window_present: Some(true),
+            weekly_percentage: 100,
+            weekly_reset_time: None,
+            weekly_window_minutes: Some(10_080),
+            weekly_window_present: Some(true),
+            reset_credits_available: None,
+            reset_credits: Vec::new(),
+            reset_credits_next_expires_at: None,
+            raw_data: Some(json!({
+                "additional_rate_limits": [{
+                    "limit_name": "GPT-Reserve",
+                    "rate_limit": { "allowed": true }
+                }],
+                "rate_limit": { "allowed": false },
+                "rate_limit_upsell": { "banner_type": "luna_reserve" }
+            })),
+        });
+        assert!(account_has_gpt_reserve_entitlement(&account));
+        let valid = account.quota.as_ref().unwrap().raw_data.clone().unwrap();
+        for (regular_allowed, reserve_allowed, banner) in [
+            (true, true, "luna_reserve"),
+            (false, false, "luna_reserve"),
+            (false, true, "upgrade"),
+        ] {
+            let mut raw = valid.clone();
+            raw["rate_limit"]["allowed"] = json!(regular_allowed);
+            raw["additional_rate_limits"][0]["rate_limit"]["allowed"] = json!(reserve_allowed);
+            raw["rate_limit_upsell"]["banner_type"] = json!(banner);
+            account.quota.as_mut().unwrap().raw_data = Some(raw);
+            assert!(!account_has_gpt_reserve_entitlement(&account),
+                "must reject regular={regular_allowed}, reserve={reserve_allowed}, banner={banner}");
+        }
+        account.quota.as_mut().unwrap().raw_data = Some(valid.clone());
+        account.auth_mode = crate::models::codex::CodexAuthMode::Apikey;
+        assert!(!account_has_gpt_reserve_entitlement(&account));
+        account.quota.as_mut().unwrap().raw_data = None;
+        assert!(!account_has_gpt_reserve_entitlement(&account));
+    }
+
+    #[test]
+    fn api_service_model_list_keeps_reserve_without_eligible_accounts() {
+        let mut entitled = test_account_with_plan("pro");
+        entitled.id = "reserve-entitled".to_string();
+        entitled.quota = Some(CodexQuota {
+            hourly_percentage: 100,
+            hourly_reset_time: None,
+            hourly_window_minutes: Some(300),
+            hourly_window_present: Some(true),
+            weekly_percentage: 100,
+            weekly_reset_time: None,
+            weekly_window_minutes: Some(10_080),
+            weekly_window_present: Some(true),
+            reset_credits_available: None,
+            reset_credits: Vec::new(),
+            reset_credits_next_expires_at: None,
+            raw_data: Some(json!({
+                "additional_rate_limits": [{
+                    "limit_name": "GPT reserve",
+                    "rate_limit": { "allowed": true }
+                }],
+                "rate_limit": { "allowed": false },
+                "rate_limit_upsell": { "banner_type": "luna_reserve" }
+            })),
+        });
+        let mut ordinary = entitled.clone();
+        ordinary.id = "reserve-ordinary".to_string();
+        ordinary.quota.as_mut().unwrap().raw_data = Some(json!({
+            "additional_rate_limits": []
+        }));
+
+        let mut collection = test_local_access_collection(vec![entitled.id.clone()]);
+        let api_key = ResolvedLocalApiKey {
+            id: "reserve-key".to_string(),
+            label: "Reserve".to_string(),
+            provider_gateway: None,
+            inherit_account_pool: true,
+            account_ids: Vec::new(),
+            model_prefix: None,
+            allowed_models: Vec::new(),
+            excluded_models: Vec::new(),
+            token_limit: None,
+            token_used: 0,
+        };
+        let entitled_models = visible_codex_model_ids_for_api_key_with_accounts(
+            &collection,
+            &api_key,
+            &[entitled.clone(), ordinary.clone()],
+            None,
+        );
+        assert!(entitled_models
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(CODEX_GPT_RESERVE_MODEL_ID)));
+
+        collection.account_ids = vec![ordinary.id.clone()];
+        let ordinary_models = visible_codex_model_ids_for_api_key_with_accounts(
+            &collection,
+            &api_key,
+            &[entitled, ordinary],
+            None,
+        );
+        assert!(ordinary_models
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(CODEX_GPT_RESERVE_MODEL_ID)));
+    }
+
+    #[test]
     fn scoped_api_key_pool_discovers_spark_entitlement_from_effective_accounts() {
         let mut plus = test_account_with_plan("plus");
         plus.id = "scoped-plus".to_string();
@@ -2720,6 +2977,7 @@ http_headers = { "x-cockpit-instance-id" = "default" }
             HashMap::new(),
             None,
             overrides,
+            true,
             None,
         )
         .expect("prepare scoped sidecar config");

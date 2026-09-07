@@ -1,6 +1,44 @@
 // Codex Local Access 测试：Takeover reconciliation, gateway configuration and remaining integration cases。
 // 测试与生产实现共享 super 作用域，验证真实网关、持久化和请求协议行为。
     #[tokio::test]
+    async fn sidecar_capacity_recovery_is_scoped_to_api_service() {
+        let collection = test_local_access_collection(Vec::new());
+        for api_service in [false, true] {
+            let dir = make_temp_dir("codex-sidecar-capacity-scope");
+            let launch = if api_service {
+                super::prepare_sidecar_launch_config_in_dir_sync(
+                    &collection,
+                    dir.clone(),
+                    HashMap::new(),
+                    None,
+                    HashMap::new(),
+                    true,
+                    None,
+                )
+            } else {
+                prepare_sidecar_launch_config_in_dir(
+                    &collection,
+                    dir.clone(),
+                    HashMap::new(),
+                    None,
+                    HashMap::new(),
+                )
+                .await
+            }
+            .expect("prepare scoped sidecar config");
+            let config: Value = serde_json::from_str(
+                &fs::read_to_string(launch.config_path).expect("read config"),
+            )
+            .expect("parse config");
+            assert_eq!(config["codex"]["api-service-compatibility"], json!(api_service));
+            assert_eq!(config["codex"]["stream-bootstrap-buffering"], json!(api_service));
+            assert_eq!(config["request-retry"], json!(super::MAX_REQUEST_RETRY_ATTEMPTS));
+            assert_eq!(config["disable-cooling"], json!(collection.disable_cooling));
+            fs::remove_dir_all(dir).expect("cleanup test config");
+        }
+    }
+
+    #[tokio::test]
     async fn local_access_takeover_writes_a_complete_model_catalog() {
         let profile_dir = make_temp_dir("codex-local-access-model-catalog-test");
         let mut collection = test_local_access_collection(Vec::new());
@@ -26,6 +64,16 @@
                 .expect("read local access model catalog"),
         )
         .expect("parse local access model catalog");
+        let reserve = catalog["models"].as_array().unwrap().iter()
+            .find(|model| model["slug"] == "gpt-reserve")
+            .expect("API Service catalog should list Reserve even with an empty account pool");
+        assert_eq!(reserve["visibility"], "list");
+        assert_eq!(reserve["display_name"], "Luna Reserve");
+        assert!(reserve["auto_compact_token_limit"].is_null());
+        assert_eq!(reserve["prefer_websockets"], false);
+        assert!(!config.contains("model_context_window"));
+        assert!(!config.contains("model_auto_compact_token_limit"));
+        assert!(!config.contains("model = \"gpt-reserve\""));
         let spark = catalog
             .get("models")
             .and_then(Value::as_array)

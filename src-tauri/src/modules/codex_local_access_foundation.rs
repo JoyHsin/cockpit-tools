@@ -1,6 +1,8 @@
 // Codex Local Access：Gateway state types, request parsing and shared protocol helpers。
 // 通过 include! 保持原 modules::codex_local_access 作用域和私有调用关系。
-use crate::models::codex::{CodexAccount, CodexApiProviderMode, CodexAppSpeed, CodexAuthMode};
+use crate::models::codex::{
+    CodexAccount, CodexApiProviderMode, CodexAppSpeed, CodexAuthMode, CodexQuota,
+};
 use crate::models::codex_local_access::{
     CodexLocalAccessAccountCooldown, CodexLocalAccessAccountHealth,
     CodexLocalAccessAccountModelRule, CodexLocalAccessAccountPoolHealth,
@@ -21,6 +23,7 @@ use crate::models::codex_local_access::{
     CodexLocalAccessStats, CodexLocalAccessStatsWindow, CodexLocalAccessTestFailure,
     CodexLocalAccessTestResult, CodexLocalAccessTimeoutPreset, CodexLocalAccessTimeouts,
     CodexLocalAccessUsageEvent, CodexLocalAccessUsageEventPage, CodexLocalAccessUsageStats,
+    CodexLocalAccessUsageTrendPoint,
     CodexTokenBreakdown,
 };
 use crate::models::{CodexInstanceApiRoute, CodexInstanceModelRouting};
@@ -30,7 +33,7 @@ use crate::modules::{
     codex_wakeup, config, logger, process,
 };
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate, TimeZone};
+use chrono::{Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate, TimeZone, Timelike};
 use futures_util::{stream, SinkExt, StreamExt};
 use rand::{distributions::Alphanumeric, seq::SliceRandom, Rng};
 use reqwest::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
@@ -202,7 +205,7 @@ const SIDECAR_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_OPENAI_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_CODEX_USER_AGENT: &str =
-    "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)";
+    "codex-tui/0.153.4 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.153.4)";
 const DEFAULT_CODEX_ORIGINATOR: &str = "codex-tui";
 const CODEX_RESPONSES_WEBSOCKET_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
@@ -229,6 +232,7 @@ const CODEX_OFFICIAL_EMPTY_HEADERS: &[&str] = &[
 const LEGACY_DEFAULT_CODEX_MODELS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
 const COMPATIBILITY_CODEX_MODELS: &[&str] = &["gpt-5.3-codex", "gpt-5.3-codex-spark"];
 const CODEX_IMAGE_MODEL_ID: &str = "gpt-image-2";
+const CODEX_GPT_RESERVE_MODEL_ID: &str = "gpt-reserve";
 const CODEX_AUTO_REVIEW_MODEL_ID: &str = "codex-auto-review";
 const DEFAULT_IMAGES_MAIN_MODEL: &str = "gpt-5.4-mini";
 const MAX_MODEL_PRICE_USD_PER_MILLION: f64 = 1_000_000.0;
@@ -428,6 +432,7 @@ struct GatewayRuntime {
     response_affinity: HashMap<String, ResponseAffinityBinding>,
     model_cooldowns: HashMap<String, AccountModelCooldown>,
     account_health: HashMap<String, RuntimeAccountHealth>,
+    account_quota_cooldowns: HashMap<String, AccountQuotaCooldown>,
     account_pool_health: HashMap<String, RuntimeAccountPoolHealth>,
     prepared_accounts: HashMap<String, CachedPreparedAccount>,
     running: bool,
@@ -1462,6 +1467,7 @@ fn prune_runtime_account_state(runtime: &mut GatewayRuntime) {
             failures.clear();
         }
         runtime.account_health.clear();
+        runtime.account_quota_cooldowns.clear();
         runtime.account_pool_health.clear();
         runtime.model_cooldowns.clear();
         runtime.response_affinity.clear();
@@ -1485,6 +1491,9 @@ fn prune_runtime_account_state(runtime: &mut GatewayRuntime) {
     }
     runtime
         .account_health
+        .retain(|account_id, _| allowed_account_ids.contains(account_id));
+    runtime
+        .account_quota_cooldowns
         .retain(|account_id, _| allowed_account_ids.contains(account_id));
     let allowed_api_key_ids = collection
         .api_keys
@@ -2514,13 +2523,17 @@ fn sidecar_scheduler_blocks_account(health: Option<&RuntimeAccountHealth>, now: 
         .unwrap_or(false)
 }
 
+fn account_health_blocks_dispatch(health: Option<&RuntimeAccountHealth>, now: i64) -> bool {
+    account_health_blocks_routing(health) || sidecar_scheduler_blocks_account(health, now)
+}
+
 async fn account_id_blocked_by_health(account_id: &str) -> bool {
     let account_id = account_id.trim();
     if account_id.is_empty() {
         return false;
     }
     let runtime = gateway_runtime().lock().await;
-    account_health_blocks_routing(runtime.account_health.get(account_id))
+    account_health_blocks_dispatch(runtime.account_health.get(account_id), now_ms())
 }
 
 fn selected_accounts_have_image_generation_capacity(
@@ -2567,6 +2580,12 @@ fn base_codex_model_ids_for_collection(
         selected_accounts_have_image_generation_capacity(collection, health_by_account_id);
     let mut model_ids =
         apply_codex_image_model_visibility(api_service_supported_codex_model_ids(), image_allowed);
+    if !model_ids
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(CODEX_GPT_RESERVE_MODEL_ID))
+    {
+        model_ids.push(CODEX_GPT_RESERVE_MODEL_ID.to_string());
+    }
     let mut seen = model_ids
         .iter()
         .map(|model| model.to_ascii_lowercase())
@@ -2807,6 +2826,13 @@ fn visible_codex_model_ids_for_api_key_with_optional_accounts(
     );
     let base =
         apply_codex_image_model_visibility(api_service_supported_codex_model_ids(), image_allowed);
+    let mut base = base;
+    if !base
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(CODEX_GPT_RESERVE_MODEL_ID))
+    {
+        base.push(CODEX_GPT_RESERVE_MODEL_ID.to_string());
+    }
     let mut visible = apply_model_filters(
         apply_model_aliases_to_ids(base, &collection.model_aliases),
         &[],

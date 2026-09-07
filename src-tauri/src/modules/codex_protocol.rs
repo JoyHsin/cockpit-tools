@@ -6,6 +6,8 @@ use crate::models::unified_model_gateway::UnifiedModelCapabilities;
 
 const REASONING_ENCRYPTED_CONTENT_INCLUDE: &str = "reasoning.encrypted_content";
 const CODEX_AUTO_REVIEW_MODEL_ID: &str = "codex-auto-review";
+const CODEX_RESERVE_MODEL_ID: &str = "gpt-reserve";
+const CODEX_RESERVE_TEMPLATE_MODEL_ID: &str = "gpt-5.6-luna";
 const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
 const CODEX_CLIENT_MODEL_TEMPLATES_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -244,6 +246,24 @@ pub fn apply_model_context_overrides(
     }
 }
 
+/// Offer Reserve for explicit selection regardless of current account quota.
+/// Luna is a capability fallback only; dispatch still checks account eligibility.
+pub(crate) fn ensure_codex_reserve_fallback(catalog: &mut Value) {
+    let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if let Some(reserve) = models.iter_mut().find(|model| {
+        model["slug"]
+            .as_str()
+            .is_some_and(|slug| slug.eq_ignore_ascii_case(CODEX_RESERVE_MODEL_ID))
+    }) {
+        reserve["visibility"] = json!("list");
+        return;
+    }
+    let reserve = build_codex_client_model(CODEX_RESERVE_MODEL_ID, models.len());
+    models.push(reserve);
+}
+
 fn apply_reasoning_effort_override(object: &mut Map<String, Value>, efforts: &[String]) {
     let levels = object
         .get("supported_reasoning_levels")
@@ -365,6 +385,11 @@ pub fn normalize_responses_body_for_codex_with_lite(
 }
 
 pub(crate) fn codex_model_uses_responses_lite(model_id: &str) -> bool {
+    if model_id.trim().eq_ignore_ascii_case(CODEX_RESERVE_MODEL_ID) {
+        return codex_client_model_template(CODEX_RESERVE_MODEL_ID).0["use_responses_lite"]
+            .as_bool()
+            .unwrap_or(false);
+    }
     let catalog = codex_client_model_catalog();
     ["model_overrides", "models"]
         .into_iter()
@@ -526,6 +551,10 @@ fn build_codex_client_model(model_id: &str, index: usize) -> Value {
         .as_object_mut()
         .expect("Codex client model template should be a JSON object");
     object.insert("slug".to_string(), Value::String(model_id.to_string()));
+    if model_id.trim().eq_ignore_ascii_case(CODEX_RESERVE_MODEL_ID) {
+        object.insert("display_name".to_string(), json!("Luna Reserve"));
+        object.insert("visibility".to_string(), json!("list"));
+    }
     if !is_catalog_model {
         let display_name = display_name_for_model(model_id);
         object.insert(
@@ -580,6 +609,15 @@ fn codex_client_model_template(model_id: &str) -> (Value, bool) {
         return (model.clone(), true);
     }
 
+    if model_id.eq_ignore_ascii_case(CODEX_RESERVE_MODEL_ID) {
+        if let Some(luna) = models
+            .iter()
+            .find(|model| model["slug"].as_str() == Some(CODEX_RESERVE_TEMPLATE_MODEL_ID))
+        {
+            return (luna.clone(), true);
+        }
+    }
+
     let default_model = models
         .iter()
         .find(|model| {
@@ -623,7 +661,7 @@ fn display_name_for_model(model_id: &str) -> String {
         "gpt-5.4-mini" => "GPT-5.4 Mini".to_string(),
         "gpt-5.3-codex" => "GPT-5.3 Codex".to_string(),
         "gpt-5.3-codex-spark" => "GPT-5.3 Codex Spark".to_string(),
-        "gpt-6-astra" => "GPT-6 Astra".to_string(),
+        "gpt-6-astra" => "6 Astra".to_string(),
         "gpt-5.2" => "GPT-5.2".to_string(),
         "gpt-5.2-codex" => "GPT-5.2 Codex".to_string(),
         "gpt-5.1-codex-max" => "GPT-5.1 Codex Max".to_string(),
@@ -899,6 +937,49 @@ fn remove_unsupported_responses_fields(obj: &mut Map<String, Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserve_is_selectable_without_changing_other_models_or_request_id() {
+        let mut catalog = build_codex_client_models_response(&[
+            "gpt-6-astra".to_string(),
+            CODEX_RESERVE_TEMPLATE_MODEL_ID.to_string(),
+        ]);
+        let before = catalog["models"].as_array().unwrap().clone();
+        ensure_codex_reserve_fallback(&mut catalog);
+        ensure_codex_reserve_fallback(&mut catalog);
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(&models[..before.len()], before.as_slice());
+        assert_eq!(models.len(), before.len() + 1);
+        let mut expected = before[1].clone();
+        expected["slug"] = json!(CODEX_RESERVE_MODEL_ID);
+        expected["visibility"] = json!("list");
+        expected["display_name"] = json!("Luna Reserve");
+        assert_eq!(models.last(), Some(&expected));
+        assert!(expected["auto_compact_token_limit"].is_null());
+
+        let explicit = build_codex_client_models_response(&[CODEX_RESERVE_MODEL_ID.to_string()]);
+        assert_eq!(explicit["models"][0], expected);
+        assert!(codex_model_uses_responses_lite(CODEX_RESERVE_MODEL_ID));
+    }
+
+    #[test]
+    fn reserve_fallback_preserves_explicit_overrides_and_custom_only_catalogs() {
+        let mut custom = json!({"models": [{"slug": "custom-model"}]});
+        let before = custom.clone();
+        ensure_codex_reserve_fallback(&mut custom);
+        assert_eq!(custom["models"][0], before["models"][0]);
+        assert_eq!(custom["models"][1]["slug"], "gpt-reserve");
+        assert_eq!(custom["models"][1]["visibility"], "list");
+
+        let mut catalog = build_codex_client_models_response(&[CODEX_RESERVE_MODEL_ID.to_string()]);
+        apply_model_context_overrides(&mut catalog, &[
+            (CODEX_RESERVE_MODEL_ID.to_string(), Some(516_000), Some(460_000))
+        ]);
+        ensure_codex_reserve_fallback(&mut catalog);
+        assert_eq!(catalog["models"][0]["context_window"], 516_000);
+        assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 460_000);
+        assert_eq!(catalog["models"][0]["visibility"], "list");
+    }
 
     #[test]
     fn merges_local_no_proxy_hosts() {
@@ -1362,7 +1443,7 @@ mod tests {
             .expect("Astra model should be present");
         assert_eq!(
             model.get("display_name").and_then(Value::as_str),
-            Some("GPT-6 Astra")
+            Some("6 Astra")
         );
         assert_eq!(
             model.get("context_window").and_then(Value::as_i64),
@@ -1410,7 +1491,7 @@ mod tests {
         let response = build_codex_client_models_response_with_model_definitions_and_reasoning(&[
             (
                 "gpt-6-astra".to_string(),
-                "GPT-6 Astra".to_string(),
+                "6 Astra".to_string(),
                 Some(vec!["low".to_string(), "ultra".to_string(), "max".to_string()]),
             ),
         ]);

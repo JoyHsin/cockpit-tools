@@ -77,7 +77,7 @@ func TestPaidCodexModelsIncludeAstraButFreeDoesNot(t *testing.T) {
 		if astra.ContextLength != 1050000 || astra.MaxCompletionTokens != 128000 {
 			t.Fatalf("Astra limits = %d/%d, want 1050000/128000", astra.ContextLength, astra.MaxCompletionTokens)
 		}
-		if astra.Thinking == nil || len(astra.Thinking.Levels) != 5 || astra.Thinking.Levels[4] != "max" {
+		if astra.Thinking == nil || len(astra.Thinking.Levels) != 6 || astra.Thinking.Levels[4] != "max" || astra.Thinking.Levels[5] != "ultra" {
 			t.Fatalf("Astra reasoning levels = %#v", astra.Thinking)
 		}
 	}
