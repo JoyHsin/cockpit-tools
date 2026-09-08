@@ -104,6 +104,7 @@ type quotaPoolWindowState struct {
 }
 
 type quotaPoolAccountState struct {
+	PlanType  string                `json:"planType,omitempty"`
 	Primary   *quotaPoolWindowState `json:"primary,omitempty"`
 	Secondary *quotaPoolWindowState `json:"secondary,omitempty"`
 	UpdatedAt *int64                `json:"updatedAt,omitempty"`
@@ -168,12 +169,15 @@ func quotaWindowValue(window *quotaPoolWindowState) (int, int64, bool) {
 	return *window.RemainingPercent, minutes, true
 }
 
-func quotaPlanLabel(account *accountSpec) string {
+func quotaPlanLabel(account *accountSpec, snapshot quotaPoolAccountState) string {
+	if account != nil && strings.EqualFold(strings.TrimSpace(account.AuthKind), "api_key") {
+		return "API_KEY"
+	}
+	if plan := strings.TrimSpace(snapshot.PlanType); plan != "" {
+		return strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(plan, "-", "_"), " ", "_"))
+	}
 	if account == nil {
 		return "UNKNOWN"
-	}
-	if strings.EqualFold(strings.TrimSpace(account.AuthKind), "api_key") {
-		return "API_KEY"
 	}
 	plan := strings.TrimSpace(account.PlanType)
 	if plan == "" {
@@ -220,7 +224,8 @@ func buildCockpitQuotaResponseWithAccounts(spec *apiKeySpec, state quotaPoolStat
 		if accounts != nil {
 			account = accounts[accountID]
 		}
-		plan := quotaPlanLabel(account)
+		item := state.Accounts[accountID]
+		plan := quotaPlanLabel(account, item)
 		index, exists := planIndex[plan]
 		if !exists {
 			index = len(result.Plans)
@@ -290,7 +295,7 @@ func buildCockpitQuotaResponseWithAccounts(spec *apiKeySpec, state quotaPoolStat
 		if accounts != nil {
 			account = accounts[accountID]
 		}
-		if index, exists := planIndex[quotaPlanLabel(account)]; exists {
+		if index, exists := planIndex[quotaPlanLabel(account, item)]; exists {
 			planSummary := &result.Plans[index]
 			if primaryOK && primaryMinutes >= 5*24*60 {
 				planSummary.WeeklyRemainingPercent = addQuotaPercent(planSummary.WeeklyRemainingPercent, primaryValue)

@@ -33,6 +33,7 @@ pub mod codex_oauth;
 pub mod codex_official_app_server;
 pub mod codex_protocol;
 pub mod codex_quota;
+pub(crate) mod codex_quota_refresh_scheduler;
 pub mod credential_broker;
 pub mod local_secret_blob;
 pub mod codex_router;
