@@ -61,6 +61,8 @@ export interface CodexAccount {
   api_vision_routing_model?: string | null;
   api_instance_access_mode?: "gateway" | "direct" | "cdp" | string | null;
   api_startup_model?: string | null;
+  /** 网关模式下用于生图转发的 GPT(OAuth) 账号池。 */
+  api_image_generation_account_ids?: string[] | null;
   bound_oauth_account_id?: string | null;
   user_id?: string;
   plan_type?: string;
@@ -76,8 +78,11 @@ export interface CodexAccount {
   account_name?: string;
   account_structure?: string;
   account_note?: string;
+  /** Legacy import/export metadata; no longer changes outgoing requests. */
   codex_fingerprint_mode?: CodexFingerprintMode;
+  /** Legacy backup metadata; no longer restricts clients or reaches the sidecar. */
   codex_cli_only?: boolean;
+  /** Legacy backup metadata; no longer grants client-policy exceptions. */
   codex_cli_only_allow_app_server?: boolean;
   two_factor_secret?: string;
   account_password?: string;
