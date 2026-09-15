@@ -3642,6 +3642,14 @@
       "accessTokenOnlyUsable": "Token usable",
       "accessTokenOnlyUsableDetail": "The subscription endpoint is limited, but quota and Codex usage work normally"
     },
+    "subscriptionReminder": {
+      "title": "Codex subscription expiring soon",
+      "description": "The following Codex subscriptions expire within 3 days. Please renew them soon.",
+      "expiresAt": "Expires: {{date}}",
+      "daysRemaining": "{{count}} day(s) left",
+      "confirm": "Confirm",
+      "recharged": "Renewed, don't remind me"
+    },
     "view": {
       "compact": "Compact view"
     },
