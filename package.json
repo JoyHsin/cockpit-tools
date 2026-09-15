@@ -18,6 +18,7 @@
     "tauri:dev": "node scripts/tauri-dev.cjs",
     "pretauri": "npm run typecheck",
     "tauri": "node scripts/tauri.cjs",
+    "tauri:build": "node scripts/tauri-build.cjs",
     "sync-version": "node scripts/sync-version.js",
     "test:rust:core": "cargo test --package cockpit-core -- --test-threads=1"
   },

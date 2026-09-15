@@ -46,6 +46,7 @@ src-tauri/native/macos-native-menu/.build/
 
 # Rust
 target/
+release-output/
 **/*.rs.bk
 docs/plugin-architecture-proposal.md
 .aitasks

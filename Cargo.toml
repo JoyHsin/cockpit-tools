@@ -6,6 +6,16 @@ members = [
 ]
 resolver = "2"
 
+# Keep local Rust build artifacts from growing disproportionately. Development
+# builds retain line tables for useful backtraces, while tests avoid creating a
+# second large incremental cache alongside `cargo check` and `tauri dev`.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
+incremental = false
+
 [workspace.dependencies]
 # Common dependencies with shared versions
 serde = { version = "1", features = ["derive"] }
