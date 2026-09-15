@@ -359,8 +359,10 @@ npm run tauri dev
 ### Compilação
 
 ```bash
-npm run tauri build
+npm run tauri:build
 ```
+
+Os instaladores locais são copiados para `release-output/`; o diretório temporário de release do Cargo é removido após o build.
 
 ---
 

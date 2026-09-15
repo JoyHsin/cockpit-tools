@@ -418,8 +418,10 @@ npm run tauri dev
 ### 构建产物
 
 ```bash
-npm run tauri build
+npm run tauri:build
 ```
+
+本地安装包会复制到 `release-output/`；临时 Cargo release 目录会在构建后自动删除。
 
 ---
 
