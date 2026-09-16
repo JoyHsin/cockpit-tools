@@ -1,0 +1,85 @@
+.codex-subscription-reminder-overlay {
+  z-index: 12500;
+  padding: 20px;
+}
+
+.codex-subscription-reminder-modal {
+  max-width: 520px;
+}
+
+.codex-subscription-reminder-body {
+  padding: 24px 28px;
+  overflow-y: auto;
+}
+
+.codex-subscription-reminder-description {
+  margin: 0 0 16px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.codex-subscription-reminder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.codex-subscription-reminder-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  background: var(--bg-tertiary);
+}
+
+.codex-subscription-reminder-account {
+  min-width: 0;
+}
+
+.codex-subscription-reminder-account strong {
+  display: block;
+  overflow: hidden;
+  color: var(--text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-subscription-reminder-plan,
+.codex-subscription-reminder-date {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.codex-subscription-reminder-days {
+  align-self: center;
+  color: var(--warning, #f59e0b);
+  font-size: 16px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+@media (max-width: 520px) {
+  .codex-subscription-reminder-overlay {
+    padding: 12px;
+  }
+
+  .codex-subscription-reminder-body,
+  .codex-subscription-reminder-modal .modal-header,
+  .codex-subscription-reminder-modal .modal-footer {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .codex-subscription-reminder-modal .modal-footer {
+    flex-direction: column-reverse;
+  }
+
+  .codex-subscription-reminder-modal .btn {
+    width: 100%;
+  }
+}

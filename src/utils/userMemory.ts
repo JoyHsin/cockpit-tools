@@ -9,6 +9,7 @@ export const USER_MEMORY_FLAGS = {
 export const USER_MEMORY_LISTS = {
   antigravityCustomSort: "antigravity.accounts.custom_sort",
   codexCustomSort: "codex.accounts.custom_sort",
+  codexSubscriptionExpiry: "codex.subscription_expiry.acknowledged",
 } as const;
 
 const LOCAL_STORAGE_KEYS: Record<string, string[]> = {
@@ -30,6 +31,9 @@ const LOCAL_STORAGE_LIST_KEYS: Record<string, string[]> = {
   ],
   [USER_MEMORY_LISTS.codexCustomSort]: [
     "agtools.codex.accounts.custom_sort_order.v1",
+  ],
+  [USER_MEMORY_LISTS.codexSubscriptionExpiry]: [
+    "agtools.codex.subscription_expiry.acknowledged.v1",
   ],
 };
 

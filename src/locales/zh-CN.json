@@ -3717,6 +3717,14 @@
       "accessTokenOnlyUsable": "Token 可用",
       "accessTokenOnlyUsableDetail": "订阅信息接口受限，但配额与 Codex 使用正常"
     },
+    "subscriptionReminder": {
+      "title": "Codex 订阅即将到期",
+      "description": "以下 Codex 账号的订阅有效期不超过 3 天，请及时充值续费。",
+      "expiresAt": "到期时间：{{date}}",
+      "daysRemaining": "还剩 {{count}} 天",
+      "confirm": "确认",
+      "recharged": "我已充值，不再提示"
+    },
     "view": {
       "compact": "紧凑视图"
     },

@@ -3884,6 +3884,14 @@
       "accessTokenOnlyUsable": "Token 可用",
       "accessTokenOnlyUsableDetail": "訂閱資訊介面受限，但配額與 Codex 使用正常"
     },
+    "subscriptionReminder": {
+      "title": "Codex 訂閱即將到期",
+      "description": "以下 Codex 帳號的訂閱有效期不超過 3 天，請及時儲值續訂。",
+      "expiresAt": "到期時間：{{date}}",
+      "daysRemaining": "還剩 {{count}} 天",
+      "confirm": "確認",
+      "recharged": "我已儲值，不再提示"
+    },
     "switchProgress": {
       "completed": "切換完成",
       "needsAttention": "需要處理",
