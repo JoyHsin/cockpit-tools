@@ -75,7 +75,11 @@ func (s *relayServer) handleExecutorBody(c *gin.Context, spec *apiKeySpec, body 
 		writeAPIError(c, http.StatusBadRequest, "model is required", "invalid_request")
 		return
 	}
-	if gateway, upstreamModel, routeStatus := resolveModelRouting(spec, model); routeStatus != "none" {
+	if spec.ModelRouting != nil && spec.ModelRouting.Automatic {
+		s.handleAutomaticModelRequest(c, spec, body, model, sourceFormat, fixedAlt)
+		return
+	}
+	if route, upstreamModel, routeStatus := resolveModelRoutingRoute(spec, model); routeStatus != "none" {
 		if routeStatus != "matched" {
 			writeAPIError(c, http.StatusNotFound, fmt.Sprintf("model route %s is not available", model), "model_route_not_available")
 			return
@@ -84,7 +88,14 @@ func (s *relayServer) handleExecutorBody(c *gin.Context, spec *apiKeySpec, body 
 			writeAPIError(c, http.StatusBadRequest, "This model is not supported on the Chat Completions endpoint", "invalid_request")
 			return
 		}
-		s.handleProviderGatewayRequest(c, gateway, body, upstreamModel, sourceFormat, fixedAlt)
+		if s.policy != nil && s.policy.tracker != nil && s.manifest != nil {
+			s.policy.tracker.recordSelectedAccount(
+				internallogging.GetRequestID(c.Request.Context()),
+				s.manifest.accountByID[strings.TrimSpace(route.ProviderAccountID)],
+				"",
+			)
+		}
+		s.handleProviderGatewayRequest(c, route.ProviderGateway, body, upstreamModel, sourceFormat, fixedAlt)
 		return
 	}
 
@@ -112,12 +123,45 @@ func (s *relayServer) handleExecutorBody(c *gin.Context, spec *apiKeySpec, body 
 }
 
 func resolveModelRouting(spec *apiKeySpec, clientModel string) (*providerGatewaySpec, string, string) {
+	route, upstreamModel, status := resolveModelRoutingRoute(spec, clientModel)
+	if route == nil {
+		return nil, upstreamModel, status
+	}
+	return route.ProviderGateway, upstreamModel, status
+}
+
+func resolveModelRoutingRoute(spec *apiKeySpec, clientModel string) (*modelRouteSpec, string, string) {
 	if spec == nil || spec.ModelRouting == nil {
 		return nil, "", "none"
 	}
 	model := stripModelPrefix(clientModel, spec)
+	if spec.ModelRouting.Automatic {
+		if automaticNativeModel(spec, model) {
+			return nil, model, "none"
+		}
+		for i := range spec.ModelRouting.Routes {
+			route := &spec.ModelRouting.Routes[i]
+			for _, candidate := range route.Models {
+				if route.ProviderGateway != nil && strings.EqualFold(candidate.ClientModel, model) {
+					return route, candidate.UpstreamModel, "matched"
+				}
+			}
+		}
+		return nil, "", "missing"
+	}
 	separator := strings.Index(model, "/")
 	if separator < 0 {
+		for i := range spec.ModelRouting.Routes {
+			route := &spec.ModelRouting.Routes[i]
+			if route.ProviderGateway == nil {
+				continue
+			}
+			for _, candidate := range route.Models {
+				if strings.EqualFold(candidate.ClientModel, model) {
+					return route, candidate.UpstreamModel, "matched"
+				}
+			}
+		}
 		return nil, model, "none"
 	}
 	namespace := strings.ToLower(strings.TrimSpace(model[:separator]))
@@ -138,7 +182,7 @@ func resolveModelRouting(spec *apiKeySpec, clientModel string) (*providerGateway
 		}
 		for _, candidate := range route.ProviderGateway.UpstreamModels {
 			if strings.EqualFold(candidate, upstreamModel) {
-				return route.ProviderGateway, candidate, "matched"
+				return route, candidate, "matched"
 			}
 		}
 		return nil, "", "missing"
@@ -206,6 +250,26 @@ func (s *relayServer) handleProviderGatewayRequest(c *gin.Context, gateway *prov
 			}
 		}
 	}
+	if wireAPI == "responses" && providerGatewayRepairsToolCallOrder(gateway) {
+		// 先关掉并行工具调用（从源头避免竞态），再还原已经落盘历史里的顺序。
+		body = providerGatewaySerializeToolCalls(body)
+		ordered, relocated, ok := providerGatewayRepairsToolCallOrderBody(body)
+		if ok && relocated > 0 {
+			body = ordered
+			if s.emitter != nil {
+				s.emitter.emit(requestDiagnosticPayload{
+					Type:         "provider_gateway_tool_call_outputs_relocated",
+					RequestID:    internallogging.GetRequestID(c.Request.Context()),
+					Method:       c.Request.Method,
+					Path:         requestPath(c.Request),
+					RequestKind:  requestKindFromPath(requestPath(c.Request)),
+					Model:        upstreamModel,
+					Transport:    diagnosticTransport(c.Request),
+					ErrorMessage: providerGatewayToolOrderDiagnostic(relocated),
+				})
+			}
+		}
+	}
 	upstreamPath := "/v1/responses"
 	upstreamBody := rewriteProviderGatewayBodyModel(body, upstreamModel)
 	if wireAPI == "chat_completions" {
@@ -224,6 +288,10 @@ func (s *relayServer) handleProviderGatewayRequest(c *gin.Context, gateway *prov
 	} else if !sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse) {
 		writeAPIError(c, http.StatusBadRequest, "provider gateway responses wire API only accepts responses requests", "invalid_request")
 		return
+	} else if isDeepSeekResponsesGateway(gateway.BaseURL) {
+		// DeepSeek 思考模式要求回放的历史带 reasoning_text，而响应出口为了兼容官方账号
+		// 已经把正文改写成 summary（见 responses_reasoning_replay.go）。
+		upstreamBody = restoreResponsesReasoningTextForReplay(upstreamBody)
 	}
 
 	upstreamURL, err := providerGatewayURL(gateway.BaseURL, upstreamPath)
