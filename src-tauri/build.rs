@@ -184,6 +184,12 @@ fn main() {
             .with_package("MacosNativeMenuSwift", "native/macos-native-menu")
             .link();
         link_macos_swift_runtime_rpaths();
+
+        if let Ok(out_dir) = std::env::var("OUT_DIR") {
+            let swift_out = std::path::PathBuf::from(out_dir).join("swift-rs/MacosNativeMenuSwift/out/Products");
+            println!("cargo:rustc-link-search=native={}", swift_out.join("Release").display());
+            println!("cargo:rustc-link-search=native={}", swift_out.join("Debug").display());
+        }
     }
 
     tauri_build::build()
