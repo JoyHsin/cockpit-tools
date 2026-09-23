@@ -283,6 +283,19 @@ mod codex_launch_args_tests {
     }
 
     #[test]
+    fn managed_store_launch_error_keeps_package_identity_cause_readable() {
+        // 三层兜底（直启 / Start-Process / 包身份）都失败时，包身份原因也要留在
+        // 错误里，否则用户复制出来的诊断看不到真正卡在哪一层。
+        let error = codex_managed_store_launch_unsafe_error(
+            "拒绝访问。 (os error 5)",
+            "PowerShell 启动 Codex 失败",
+            "package_identity_error=包身份启动失败: status=exit code: 1; launch_path_exists=true",
+        );
+        assert!(error.contains("package_identity_error="));
+        assert!(error.contains("launch_path_exists=true"));
+    }
+
+    #[test]
     fn managed_store_launch_error_omits_empty_diagnostics() {
         let error = codex_managed_store_launch_unsafe_error("denied", "fallback failed", "  ");
         assert_eq!(
@@ -664,6 +677,77 @@ mod windows_codex_exe_match_tests {
 }
 
 #[cfg(test)]
+mod codex_package_identity_launch_tests {
+    use super::{
+        quote_windows_command_argument, windowsapps_install_location_from_launch_path,
+        windowsapps_package_family,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn quotes_arguments_that_contain_spaces() {
+        // `--user-data-dir` 指向的实例目录常含空格，必须整体加引号。
+        assert_eq!(
+            quote_windows_command_argument(
+                r"--user-data-dir=C:\Users\some user\.antigravity_cockpit\ud"
+            ),
+            r#""--user-data-dir=C:\Users\some user\.antigravity_cockpit\ud""#
+        );
+    }
+
+    #[test]
+    fn leaves_simple_arguments_untouched() {
+        assert_eq!(
+            quote_windows_command_argument("--remote-debugging-port=9333"),
+            "--remote-debugging-port=9333"
+        );
+        assert_eq!(quote_windows_command_argument(""), "\"\"");
+    }
+
+    #[test]
+    fn escapes_embedded_quotes_and_backslash_runs() {
+        // CreateProcess 规则：引号前的反斜杠加倍，引号自身再转义一个。
+        assert_eq!(quote_windows_command_argument(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_windows_command_argument(r"a\b"), r"a\b");
+        // 以反斜杠结尾时收尾引号必须被保护，否则会把参数引号转义掉。
+        assert_eq!(
+            quote_windows_command_argument(r"C:\dir with space\"),
+            r#""C:\dir with space\\""#
+        );
+    }
+
+    #[test]
+    fn derives_install_location_from_store_launch_path() {
+        assert_eq!(
+            windowsapps_install_location_from_launch_path(Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.908.9136.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+            ))
+            .as_deref(),
+            Some(r"C:\Program Files\WindowsApps\OpenAI.Codex_26.908.9136.0_x64__2p2nqsd0c76g0")
+        );
+        // 非商店路径不能落到包身份分支上。
+        assert!(windowsapps_install_location_from_launch_path(Path::new(
+            r"C:\Users\me\AppData\Local\Programs\Codex\Codex.exe"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn install_location_round_trips_to_the_registered_package_family() {
+        // 外层脚本按 InstallLocation 反查包，这里确认解析结果仍属同一包族。
+        let install_location = windowsapps_install_location_from_launch_path(Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.908.9136.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+        ))
+        .expect("store path should resolve");
+        let fake_exe = format!(r"{}\app\ChatGPT.exe", install_location);
+        assert_eq!(
+            windowsapps_package_family(&fake_exe).as_deref(),
+            Some("openai.codex")
+        );
+    }
+}
+
+#[cfg(test)]
 mod windows_launch_fallback_tests {
     use super::{is_windowsapps_launch_path, windows_powershell_executable_candidates};
     use std::path::{Path, PathBuf};
@@ -699,5 +783,115 @@ mod windows_launch_fallback_tests {
         assert!(!is_windowsapps_launch_path(Path::new(
             r"C:\Users\me\AppData\Local\Programs\Codex\Codex.exe"
         )));
+    }
+}
+
+#[cfg(test)]
+mod codex_store_gui_exe_tests {
+    use super::{appx_manifest_gui_executable_from_text, is_chatgpt_store_gui_exe};
+    use std::path::Path;
+
+    /// 真实清单的精简版：`App` 是桌面端入口，`CodexCoreCommandRunner` 是另一个应用。
+    const REAL_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Applications>
+    <Application Id="App" Executable="app/ChatGPT.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="ChatGPT" />
+    </Application>
+    <Application Id="CodexCoreCommandRunner" Executable="app/resources/codex-command-runner.exe" EntryPoint="Windows.FullTrustApplication" />
+  </Applications>
+</Package>"#;
+
+    #[test]
+    fn picks_the_app_application_executable() {
+        assert_eq!(
+            appx_manifest_gui_executable_from_text(REAL_MANIFEST).as_deref(),
+            Some("app/ChatGPT.exe")
+        );
+    }
+
+    #[test]
+    fn ignores_other_applications_and_missing_executable() {
+        // Id 顺序对调也要命中 App，而不是第一个 Application 节点。
+        let other_first = r#"<Application Id="CodexCoreCommandRunner" Executable="app/resources/codex-command-runner.exe" /><Application Id="App" Executable="app/ChatGPT.exe" />"#;
+        assert_eq!(
+            appx_manifest_gui_executable_from_text(other_first).as_deref(),
+            Some("app/ChatGPT.exe")
+        );
+        assert_eq!(
+            appx_manifest_gui_executable_from_text(r#"<Application Id="App" />"#),
+            None
+        );
+        assert_eq!(appx_manifest_gui_executable_from_text("<Package />"), None);
+        assert_eq!(appx_manifest_gui_executable_from_text(""), None);
+    }
+
+    #[test]
+    fn only_accepts_the_chatgpt_gui_binary() {
+        assert!(is_chatgpt_store_gui_exe(Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"
+        )));
+        assert!(is_chatgpt_store_gui_exe(Path::new(
+            r"E:\WindowsApps\OpenAI.Codex_1.0.0.0_x64__8wekyb3d8bbwe\app\chatgpt.EXE"
+        )));
+        // 同包目录里的另外两个 exe 都不是桌面端入口。
+        assert!(!is_chatgpt_store_gui_exe(Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__8wekyb3d8bbwe\app\Codex.exe"
+        )));
+        assert!(!is_chatgpt_store_gui_exe(Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__8wekyb3d8bbwe\app\resources\codex.exe"
+        )));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolves_gui_exe_from_manifest_and_falls_back_to_convention() {
+        use super::codex_store_gui_exe_in;
+
+        let root = std::env::temp_dir().join(format!(
+            "cockpit-tools-codex-store-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 1) 清单声明 app/ChatGPT.exe 且文件存在 → 采信清单
+        let with_manifest = root.join("with-manifest");
+        std::fs::create_dir_all(with_manifest.join("app")).expect("create app dir");
+        std::fs::write(with_manifest.join("AppxManifest.xml"), REAL_MANIFEST)
+            .expect("write manifest");
+        std::fs::write(with_manifest.join("app").join("ChatGPT.exe"), b"stub")
+            .expect("write exe");
+        assert_eq!(
+            codex_store_gui_exe_in(&with_manifest),
+            Some(with_manifest.join("app").join("ChatGPT.exe"))
+        );
+
+        // 2) 读不到清单 → 退回约定路径 app\ChatGPT.exe
+        let no_manifest = root.join("no-manifest");
+        std::fs::create_dir_all(no_manifest.join("app")).expect("create app dir");
+        std::fs::write(no_manifest.join("app").join("ChatGPT.exe"), b"stub").expect("write exe");
+        assert_eq!(
+            codex_store_gui_exe_in(&no_manifest),
+            Some(no_manifest.join("app").join("ChatGPT.exe"))
+        );
+
+        // 3) 只有 Codex.exe → 不再猜其它 exe
+        let only_codex = root.join("only-codex");
+        std::fs::create_dir_all(only_codex.join("app")).expect("create app dir");
+        std::fs::write(only_codex.join("app").join("Codex.exe"), b"stub").expect("write exe");
+        assert_eq!(codex_store_gui_exe_in(&only_codex), None);
+
+        // 4) 清单指向非 ChatGPT.exe → 不接受
+        let manifest_other = root.join("manifest-other");
+        std::fs::create_dir_all(manifest_other.join("app")).expect("create app dir");
+        std::fs::write(
+            manifest_other.join("AppxManifest.xml"),
+            br#"<Application Id="App" Executable="app/Codex.exe" />"#,
+        )
+        .expect("write manifest");
+        std::fs::write(manifest_other.join("app").join("Codex.exe"), b"stub").expect("write exe");
+        assert_eq!(codex_store_gui_exe_in(&manifest_other), None);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

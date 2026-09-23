@@ -6,9 +6,8 @@ import { isVerboseCodexQuotaErrorMessage, summarizeCodexQuotaErrorMessage } from
 import { CodexQuotaMiniRows } from "../components/codex/CodexQuotaMiniRows";
 import { CodexTeamQuotaHistory } from "../components/codex/CodexTeamQuotaHistory";
 import { isCodexClientReauthNoticeOnly, isCodexRefreshTokenNoticeOnly, isCodexRefreshTokenReusedAccount, isCodexServerRevokedReauth } from "../utils/codexSwitchAuthFailure";
-import { DEFAULT_CODEX_INSTANCE_ID } from "../components/codex/CodexLaunchPreviewModal";
-import { isDeepSeekAccount, isCodexTokenPlanAccount, shouldShowCodexApiKeyUsagePanel } from "../utils/codexDeepSeekAccess";
-import { CodexSpeedSelect } from "../components/codex/CodexSpeedSelect";
+import { CODEX_LAUNCH_PREVIEW_API_SERVICE_CARD_KEY } from "../utils/codexLaunchPreviewInstancePreference";
+ import { isDeepSeekAccount, isCodexTokenPlanAccount, shouldShowCodexApiKeyUsagePanel } from "../utils/codexDeepSeekAccess";
 import { SingleSelectDropdown } from "../components/SingleSelectDropdown";
 import { CODEX_API_SERVICE_BIND_ID } from "../types/instance";
 import { COCKPIT_API_BASE_URL } from "../utils/codexProviderPresets";
@@ -29,7 +28,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
   | "addingLocalAccessAccountId"
   | "apiKeyUsageDetailAccount"
   | "apiKeyUsageMap"
-  | "apiServiceAppSpeed"
   | "applyWindowStatsToQuotaItems"
   | "batchImportOpen"
   | "boundLocalAccessOAuthAccount"
@@ -56,7 +54,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
   | "groupByTag"
   | "handleAccountNameDoubleClick"
   | "handleAddLocalAccessAccount"
-  | "handleApiServiceAppSpeedChange"
   | "handleCopyLocalAccessValue"
   | "handleDelete"
   | "handleEnterGroup"
@@ -123,7 +120,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
   | "refreshingSubscriptionAccountId"
   | "removingGroupAccountIds"
   | "renderAccountNoteButton"
-  | "renderAccountSpeedSelect"
   | "renderAddLocalAccessAccountButton"
   | "renderApiKeyRevealLine"
   | "renderApiKeyUsagePanel"
@@ -144,7 +140,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
   | "resolveUsageProviderForApiKeyAccount"
   | "resolveVisibleQuotaItems"
   | "savingApiKeyNameId"
-  | "savingAppSpeedId"
   | "selected"
   | "selectedLocalAccessAddressKind"
   | "setActiveTab"
@@ -153,9 +148,9 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
   | "setEditingApiKeyNameValue"
   | "setExternalImportSyncError"
   | "setGroupQuickAddGroupId"
-  | "setImportApiServiceGuideCount"
-  | "setLaunchPreviewInstanceId"
-  | "setLocalAccessDetailsExpanded"
+   | "setImportApiServiceGuideCount"
+   | "restoreLaunchPreviewInstanceId"
+   | "setLocalAccessDetailsExpanded"
   | "setLocalAccessKeyVisible"
   | "setLocalAccessLaunchPreviewOpen"
   | "setMessage"
@@ -175,7 +170,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
     addingLocalAccessAccountId,
     apiKeyUsageDetailAccount,
     apiKeyUsageMap,
-    apiServiceAppSpeed,
     applyWindowStatsToQuotaItems,
     batchImportOpen,
     boundLocalAccessOAuthAccount,
@@ -202,7 +196,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
     groupByTag,
     handleAccountNameDoubleClick,
     handleAddLocalAccessAccount,
-    handleApiServiceAppSpeedChange,
     handleCopyLocalAccessValue,
     handleDelete,
     handleEnterGroup,
@@ -269,7 +262,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
     refreshingSubscriptionAccountId,
     removingGroupAccountIds,
     renderAccountNoteButton,
-    renderAccountSpeedSelect,
     renderAddLocalAccessAccountButton,
     renderApiKeyRevealLine,
     renderApiKeyUsagePanel,
@@ -290,7 +282,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
     resolveUsageProviderForApiKeyAccount,
     resolveVisibleQuotaItems,
     savingApiKeyNameId,
-    savingAppSpeedId,
     selected,
     selectedLocalAccessAddressKind,
     setActiveTab,
@@ -298,10 +289,10 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
     setCockpitApiPanelAccountId,
     setEditingApiKeyNameValue,
     setExternalImportSyncError,
-    setGroupQuickAddGroupId,
-    setImportApiServiceGuideCount,
-    setLaunchPreviewInstanceId,
-    setLocalAccessDetailsExpanded,
+     setGroupQuickAddGroupId,
+     setImportApiServiceGuideCount,
+     restoreLaunchPreviewInstanceId,
+     setLocalAccessDetailsExpanded,
     setLocalAccessKeyVisible,
     setLocalAccessLaunchPreviewOpen,
     setMessage,
@@ -523,7 +514,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
                 </span>
               )}
             </div>
-            {renderAccountSpeedSelect(account, true)}
             {renderAddLocalAccessAccountButton(
               account,
               "codex-compact-api-service-btn",
@@ -533,7 +523,7 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
               <button
                 type="button"
                 className="codex-compact-note-btn codex-compact-reauthorize-btn"
-                onClick={() => openCodexAddModal("oauth", account)}
+                onClick={() => openCodexAddModal("tempLogin", account)}
                 title={t("common.reauthorize", "重新授权")}
                 aria-label={t("common.reauthorize", "重新授权")}
               >
@@ -975,7 +965,7 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
                         isRefreshNotice: true,
                         showReauthorize: true,
                         onReauthorize: () =>
-                          openCodexAddModal("oauth", account),
+                          openCodexAddModal("tempLogin", account),
                       })}
                     {!isPendingOAuthAccount &&
                       hasQuotaError &&
@@ -993,7 +983,8 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
                             : undefined,
                         isRefreshNotice: isQuotaRefreshNotice,
                         showReauthorize: showReauthorizeAction,
-                        onReauthorize: () => openCodexAddModal("oauth", account),
+                        onReauthorize: () =>
+                          openCodexAddModal("tempLogin", account),
                       })}
                     {cockpitApiAccountBalanceText && (
                       <div className="codex-account-balance-line">
@@ -1073,7 +1064,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
             )}
             <div className="codex-card-bottom">
               <span className="card-date">{formatDate(account.created_at)}</span>
-              {renderAccountSpeedSelect(account)}
               <div className="card-footer">
                 <div className="card-actions">
                   <button
@@ -1710,13 +1700,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
                     defaultValue: "监听范围：{{scope}}",
                   })}
                 </span>
-                <CodexSpeedSelect
-                  value={apiServiceAppSpeed}
-                  onChange={handleApiServiceAppSpeedChange}
-                  busy={savingAppSpeedId === CODEX_API_SERVICE_BIND_ID}
-                  preferredPlacement="top"
-                  ariaLabel={t("codex.speed.title", "速度")}
-                />
                 <div
                   className={`card-footer codex-local-access-footer ${
                     importApiServiceGuideCount !== null &&
@@ -1827,7 +1810,9 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
                         className="card-action-btn success"
                         onClick={() => {
                           setImportApiServiceGuideCount(null);
-                          setLaunchPreviewInstanceId(DEFAULT_CODEX_INSTANCE_ID);
+                          restoreLaunchPreviewInstanceId(
+                            CODEX_LAUNCH_PREVIEW_API_SERVICE_CARD_KEY,
+                          );
                           setLocalAccessLaunchPreviewOpen(true);
                         }}
                         title={t(
@@ -2228,7 +2213,6 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
                       {t("codex.current", "当前")}
                     </span>
                   )}
-                  {renderAccountSpeedSelect(account, true)}
                 </div>
                 {(meta.accountContextText ||
                   isInLocalAccess ||
@@ -2444,7 +2428,8 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
                           : undefined,
                       isRefreshNotice: isQuotaRefreshNotice,
                       showReauthorize: showReauthorizeAction,
-                      onReauthorize: () => openCodexAddModal("oauth", account),
+                      onReauthorize: () =>
+                        openCodexAddModal("tempLogin", account),
                       table: true,
                     })}
                   {isPendingOAuthAccount && (

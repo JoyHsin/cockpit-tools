@@ -164,6 +164,7 @@ func main() {
 	tokenLimiter := newAPIKeyTokenLimiter(m)
 	policy := &requestPolicy{
 		manifest:     m,
+		cfg:          cfg,
 		emitter:      emitter,
 		tracker:      usageTracker,
 		tokenLimiter: tokenLimiter,

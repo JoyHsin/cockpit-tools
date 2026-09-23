@@ -48,6 +48,10 @@ func (s *relayServer) router() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(corsMiddleware())
+	router.Use(func(c *gin.Context) {
+		s.bindRelayContext(c)
+		c.Next()
+	})
 	router.Use(s.unifiedGatewayMiddleware())
 	router.Use(s.policy.middleware())
 	router.GET("/_cockpit-ugw/healthz", s.handleUnifiedHealthz)
@@ -609,7 +613,7 @@ func (s *relayServer) handleModels(c *gin.Context) {
 	}
 	models := clientCatalogModelsForAPIKey(s.manifest, spec)
 	if isCodexClientModelsRequest(c.Request) {
-		c.JSON(http.StatusOK, buildCodexClientModelsResponse(models, spec, contextWindowsForAPIKey(s.manifest, spec)))
+		c.JSON(http.StatusOK, buildCodexClientModelsResponse(models, spec, contextWindowsForAPIKey(s.manifest, spec), s.manifest))
 		return
 	}
 	c.JSON(http.StatusOK, buildModelsResponse(models))

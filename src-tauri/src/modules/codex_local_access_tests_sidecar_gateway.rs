@@ -537,6 +537,8 @@
                 CodexLocalAccessRequestKind::Text,
                 None,
                 None,
+                None,
+                None,
                 true,
                 Some(200),
                 None,
@@ -1283,6 +1285,28 @@
     }
 
     #[test]
+    fn sidecar_manifest_exposes_image_generation_accounts_for_default_key() {
+        let mut collection = test_local_access_collection(vec!["chat-account".to_string()]);
+        collection.image_generation_account_ids = vec![
+            "gpt-image-account".to_string(),
+            "gpt-image-account".to_string(),
+        ];
+
+        let legacy = sidecar_api_key_manifest_values(&collection)
+            .into_iter()
+            .find(|value| value.get("id").and_then(Value::as_str) == Some("legacy"))
+            .expect("default API key should be emitted");
+        let image_account_ids = legacy
+            .get("imageGenerationAccountIds")
+            .and_then(Value::as_array)
+            .expect("imageGenerationAccountIds should be an array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(image_account_ids, vec!["gpt-image-account"]);
+    }
+
+    #[test]
     fn api_key_priority_queue_respects_custom_scope_session_affinity_and_fallbacks() {
         let mut collection = test_local_access_collection(vec![
             "account-a".to_string(),
@@ -1668,7 +1692,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         collection.api_keys = vec![key.clone()];
         assert!(super::collection_pool_contains_official_deepseek_account(&collection));
 
-        // 上游不是 DeepSeek 时不改动 profile。
+        // 账号池没有能承接官方 GPT 模型的账号（这里是第三方 Chat 协议供应商）时，
+        // 压缩同样回到本地流程：这类上游没有可用的服务端压缩，远端压缩还会带着旧模型 ID 发出。
         key.provider_gateway = Some(CodexLocalAccessProviderGateway {
             base_url: "https://token-plan-cn.xiaomimimo.com/v1".to_string(),
             ..deepseek_gateway.clone()
@@ -1688,10 +1713,15 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         .expect("write profile config");
 
         ensure_local_compaction_for_account_pool(&profile_dir, &other_collection)
-            .expect("skip non-deepseek pool");
-        assert_eq!(
-            fs::read_to_string(&config_path).expect("read profile config"),
-            original
+            .expect("apply local compaction for non-gpt pool");
+        let non_gpt_applied = fs::read_to_string(&config_path).expect("read profile config");
+        assert!(
+            non_gpt_applied.contains("remote_compaction_v2 = false"),
+            "非 GPT 账号池必须回到本地压缩: {non_gpt_applied}"
+        );
+        assert!(
+            non_gpt_applied.contains("service_tier = \"priority\""),
+            "压缩兜底只动压缩键，其它配置保持不变: {non_gpt_applied}"
         );
 
         ensure_local_compaction_for_account_pool(&profile_dir, &collection)
@@ -1993,14 +2023,28 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     }
 
     #[test]
-    fn provider_gateway_model_slots_keep_identity_for_gpt_6_astra() {
-        let slots = provider_gateway_model_slots(&["gpt-6-astra".to_string()]);
+    fn provider_gateway_model_slots_keep_identity_for_gpt_6_family() {
+        let slots = provider_gateway_model_slots(&[
+            "gpt-6-astra".to_string(),
+            "gpt-6-sol".to_string(),
+            "gpt-6-luna".to_string(),
+        ]);
         assert_eq!(
             slots,
-            vec![super::ProviderGatewayModelSlot {
-                client_model: "gpt-6-astra".to_string(),
-                upstream_model: "gpt-6-astra".to_string(),
-            }]
+            vec![
+                super::ProviderGatewayModelSlot {
+                    client_model: "gpt-6-astra".to_string(),
+                    upstream_model: "gpt-6-astra".to_string(),
+                },
+                super::ProviderGatewayModelSlot {
+                    client_model: "gpt-6-sol".to_string(),
+                    upstream_model: "gpt-6-sol".to_string(),
+                },
+                super::ProviderGatewayModelSlot {
+                    client_model: "gpt-6-luna".to_string(),
+                    upstream_model: "gpt-6-luna".to_string(),
+                },
+            ]
         );
     }
 
@@ -3819,6 +3863,7 @@ http_headers = { "x-cockpit-instance-id" = "default" }
                     model_capabilities: HashMap::new(),
                     vision_routing_model: None,
                 },
+                native_provider: None,
             }],
         });
         collection.api_keys = vec![api_key];
@@ -3880,4 +3925,131 @@ http_headers = { "x-cockpit-instance-id" = "default" }
                     && !display_name.trim().is_empty()),
             "官方模型需要带展示名"
         );
+    }
+
+    /// 只加了 DeepSeek + Grok 等第三方账号时，客户端目录里不能出现 GPT-5.6 Reserve。
+    #[test]
+    fn profile_catalog_only_offers_reserve_when_official_gpt_models_are_present() {
+        let third_party_only = serde_json::json!({
+            "models": [
+                {"slug": "deepseek-flash"},
+                {"slug": "deepseek-v4-pro"},
+                {"slug": "grok-4.6"},
+                {"slug": "codex-auto-review", "visibility": "hide"},
+            ]
+        });
+        assert!(!super::profile_catalog_allows_reserve(&third_party_only));
+
+        let with_official = serde_json::json!({
+            "models": [{"slug": "gpt-5.6-sol"}, {"slug": "grok-4.6"}]
+        });
+        assert!(super::profile_catalog_allows_reserve(&with_official));
+
+        // 用户显式列出 gpt-reserve 时保持原样，不做二次隐藏。
+        let explicit_reserve = serde_json::json!({"models": [{"slug": "gpt-reserve"}]});
+        assert!(super::profile_catalog_allows_reserve(&explicit_reserve));
+    }
+
+    /// 模型管理目录必须等于客户端实际会渲染的模型：无 GPT 能力时去掉官方 GPT，并补入账号池 extras。
+    #[tokio::test]
+    async fn experimental_catalog_overlays_pool_models_and_hides_gpt_without_capability() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _env = LocalAccessTestDataGuard::new("catalog-overlay-pool");
+        let profile_dir = make_temp_dir("catalog-overlay-profile");
+
+        let mut deepseek = CodexAccount::new_api_key(
+            "deepseek-overlay".to_string(),
+            "deepseek-overlay@example.com".to_string(),
+            "sk-deepseek-overlay".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.deepseek.com".to_string()),
+            Some("deepseek".to_string()),
+            Some("DeepSeek".to_string()),
+            vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()],
+        );
+        deepseek.api_wire_api = Some("responses".to_string());
+        let mut grok = CodexAccount::new_api_key(
+            "grok-overlay".to_string(),
+            "grok-overlay@example.com".to_string(),
+            String::new(),
+            CodexApiProviderMode::Custom,
+            None,
+            Some("grok".to_string()),
+            Some("Grok".to_string()),
+            vec![
+                "grok-4.6".to_string(),
+                "grok-4.5".to_string(),
+                "grok-4.3".to_string(),
+            ],
+        );
+        grok.api_wire_api = Some("responses".to_string());
+        grok.upstream_grok_account_id = Some("grok-source".to_string());
+        grok.openai_api_key = None;
+        crate::modules::codex_account::save_account(&deepseek).expect("save deepseek");
+        crate::modules::codex_account::save_account(&grok).expect("save grok");
+
+        let mut collection = test_local_access_collection(vec![deepseek.id.clone(), grok.id.clone()]);
+        collection.restrict_free_accounts = false;
+        super::save_collection_to_disk(&collection).expect("save collection");
+        write_local_access_profile_takeover(&profile_dir, &collection, None, true)
+            .await
+            .expect("attach profile");
+
+        let official = vec![
+            crate::models::codex::CodexExperimentalModelDefinition {
+                model_id: "gpt-5.6-luna".to_string(),
+                display_name: "5.6 Luna".to_string(),
+                reasoning_efforts: None,
+                context_window: Some(516000),
+                auto_compact_token_limit: Some(460000),
+            },
+            crate::models::codex::CodexExperimentalModelDefinition {
+                model_id: "gpt-reserve".to_string(),
+                display_name: "GPT-5.6 Reserve".to_string(),
+                reasoning_efforts: None,
+                context_window: None,
+                auto_compact_token_limit: None,
+            },
+        ];
+        let overlaid = super::overlay_rendered_pool_models_on_experimental_catalog(
+            &profile_dir,
+            official,
+        );
+        let ids = overlaid
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "deepseek-flash",
+                "deepseek-v4-pro",
+                "grok-4.6",
+                "grok-4.5",
+                "grok-4.3",
+            ],
+            "无 GPT 能力时应只保留账号池可见模型: {ids:?}"
+        );
+        assert_eq!(
+            overlaid[0].display_name,
+            crate::modules::codex_account::provider_model_display_name("deepseek-flash")
+        );
+
+        let mut with_context = overlaid.clone();
+        with_context[2].context_window = Some(1_000_000);
+        with_context[2].auto_compact_token_limit = Some(900_000);
+        let preserved = super::overlay_rendered_pool_models_on_experimental_catalog(
+            &profile_dir,
+            with_context,
+        );
+        let grok_46 = preserved
+            .iter()
+            .find(|model| model.model_id == "grok-4.6")
+            .expect("grok-4.6");
+        assert_eq!(grok_46.context_window, Some(1_000_000));
+        assert_eq!(grok_46.auto_compact_token_limit, Some(900_000));
+
+        fs::remove_dir_all(profile_dir).expect("cleanup overlay profile");
     }

@@ -216,7 +216,7 @@ func (s *relayServer) handleUnifiedModels(c *gin.Context) {
 		}
 	}
 	if isCodexClientModelsRequest(c.Request) {
-		response := buildCodexClientModelsResponse(ids, nil, nil)
+		response := buildCodexClientModelsResponse(ids, nil, nil, s.manifest)
 		if models, ok := response["models"].([]map[string]any); ok {
 			for _, model := range models {
 				id, _ := model["id"].(string)

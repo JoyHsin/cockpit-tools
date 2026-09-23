@@ -14,6 +14,24 @@ enum NativeMenuPalette {
     static let switcherHoverBackground = Color(nsColor: .controlColor).opacity(0.55)
 }
 
+@propertyWrapper
+private struct LocalState<Value>: DynamicProperty {
+    private var state: SwiftUI.State<Value>
+
+    init(wrappedValue: Value) {
+        self.state = SwiftUI.State(initialValue: wrappedValue)
+    }
+
+    var wrappedValue: Value {
+        get { self.state.wrappedValue }
+        nonmutating set { self.state.wrappedValue = newValue }
+    }
+
+    var projectedValue: Binding<Value> {
+        self.state.projectedValue
+    }
+}
+
 struct NativeMenuSwitcherSectionView: View {
     @ObservedObject var controller: NativeMenuPopoverController
     let snapshot: NativeMenuSnapshot
@@ -171,7 +189,7 @@ private struct ProviderSwitchTile: View {
     let platform: NativeMenuPlatform
     let selected: Bool
     let onSelect: () -> Void
-    @State private var hovering = false
+    @LocalState private var hovering = false
 
     var body: some View {
         Button(action: self.onSelect) {
@@ -401,7 +419,7 @@ private struct ActionCapsuleButton: View {
     let emphasized: Bool
     let disabled: Bool
     let action: () -> Void
-    @State private var hovering = false
+    @LocalState private var hovering = false
 
     var body: some View {
         Button(action: self.action) {
@@ -444,7 +462,7 @@ private struct ActionCapsuleButton: View {
 private struct PagerButton: View {
     let systemName: String
     let action: () -> Void
-    @State private var hovering = false
+    @LocalState private var hovering = false
 
     var body: some View {
         Button(action: self.action) {
@@ -469,7 +487,7 @@ private struct ToolbarIconButton: View {
     let spinning: Bool
     let disabled: Bool
     let action: () -> Void
-    @State private var hovering = false
+    @LocalState private var hovering = false
 
     var body: some View {
         Button(action: self.action) {

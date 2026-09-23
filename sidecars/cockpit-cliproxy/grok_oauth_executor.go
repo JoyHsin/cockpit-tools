@@ -1024,7 +1024,7 @@ func (s *relayServer) handleBrokerProviderRequest(c *gin.Context, body []byte, r
 			reader, writer := io.Pipe()
 			done := make(chan struct{})
 			go func() {
-				s.writeProviderGatewayChatStream(c, reader, upstreamModel, body, upstreamBody)
+				s.writeProviderGatewayChatStream(c, reader, upstreamModel, body, upstreamBody, false)
 				close(done)
 			}()
 			_, streamErr := broker.ExecuteProviderStream(

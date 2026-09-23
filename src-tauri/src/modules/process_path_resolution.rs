@@ -2109,184 +2109,168 @@ fn resolve_codebuddy_macos_exec_path(path_str: &str) -> Option<std::path::PathBu
     resolve_macos_exec_path(path_str, "CodeBuddy")
 }
 
-#[cfg(target_os = "windows")]
-fn compare_windows_store_version(left: &[u32], right: &[u32]) -> std::cmp::Ordering {
-    let max_len = left.len().max(right.len());
-    for idx in 0..max_len {
-        let left_part = *left.get(idx).unwrap_or(&0);
-        let right_part = *right.get(idx).unwrap_or(&0);
-        match left_part.cmp(&right_part) {
-            std::cmp::Ordering::Equal => continue,
-            non_eq => return non_eq,
+/// 商店版 Codex 桌面端在 `InstallLocation` 下的约定相对路径，取自 `AppxManifest.xml`
+/// 里 `Application Id="App"` 的 `Executable`。
+#[cfg(any(test, target_os = "windows"))]
+const CODEX_STORE_GUI_RELATIVE_EXE: &str = r"app\ChatGPT.exe";
+
+/// 只接受商店版 Codex 桌面端的主界面程序 `ChatGPT.exe`。
+///
+/// 同一个包目录里还有 `app\Codex.exe`（另一个 GUI 二进制，不是启动入口）与
+/// `app\resources\codex.exe`（CLI），都不能当官方桌面端的启动路径。
+#[cfg(any(test, target_os = "windows"))]
+fn is_chatgpt_store_gui_exe(path: &std::path::Path) -> bool {
+    // 测试会在非 Windows 平台构造 Windows 风格路径，Unix 下 `Path::file_name()`
+    // 不把 `\` 当分隔符，会返回整串；这里按两种分隔符取最后一段。
+    path.to_string_lossy()
+        .rsplit(|value| value == '\\' || value == '/')
+        .next()
+        .is_some_and(|value| value.eq_ignore_ascii_case("ChatGPT.exe"))
+}
+
+/// 读取 `AppxManifest.xml` 里 `Application Id="App"` 的 `Executable`。
+#[cfg(any(test, target_os = "windows"))]
+fn appx_manifest_gui_executable(install_location: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(install_location.join("AppxManifest.xml")).ok()?;
+    appx_manifest_gui_executable_from_text(&String::from_utf8_lossy(&bytes))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn appx_manifest_gui_executable_from_text(text: &str) -> Option<String> {
+    for element in text.split('<') {
+        let element = element.trim_start();
+        if !element.starts_with("Application") {
+            continue;
+        }
+        match xml_attribute(element, "Id") {
+            Some(id) if id.eq_ignore_ascii_case("App") => {}
+            _ => continue,
+        }
+        if let Some(executable) = xml_attribute(element, "Executable") {
+            return Some(executable);
         }
     }
-    std::cmp::Ordering::Equal
+    None
 }
 
-#[cfg(target_os = "windows")]
-fn parse_codex_store_version_from_dir_name(dir_name: &str) -> Option<Vec<u32>> {
-    let lower = dir_name.to_ascii_lowercase();
-    let prefix = [
-        "openai.chatgpt_",
-        "openai.chatgpt-desktop_",
-        "openai.codex_",
-    ]
-    .iter()
-    .find(|prefix| lower.starts_with(**prefix))?;
-    let suffix = dir_name.get(prefix.len()..)?;
-    let version_part = suffix.split('_').next()?.trim();
-    if version_part.is_empty() {
+#[cfg(any(test, target_os = "windows"))]
+fn xml_attribute(element: &str, name: &str) -> Option<String> {
+    let needle = format!("{}=\"", name);
+    let start = element.find(&needle)? + needle.len();
+    let rest = &element[start..];
+    let end = rest.find('"')?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
         return None;
     }
-    let mut version: Vec<u32> = Vec::new();
-    for part in version_part.split('.') {
-        if part.is_empty() {
-            return None;
-        }
-        version.push(part.parse::<u32>().ok()?);
-    }
-    if version.is_empty() {
-        return None;
-    }
-    Some(version)
+    Some(value.to_string())
 }
 
-#[cfg(target_os = "windows")]
-fn codex_store_package_priority(dir_name: &str) -> u8 {
-    let lower = dir_name.to_ascii_lowercase();
-    if lower.starts_with("openai.chatgpt_") || lower.starts_with("openai.chatgpt-desktop_") {
-        2
-    } else if lower.starts_with("openai.codex_") {
-        1
-    } else {
-        0
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn find_codex_windows_app_main_exe(app_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    for exe_name in ["ChatGPT.exe", "Codex.exe"] {
-        let candidate = app_dir.join(exe_name);
-        if candidate.exists() {
+/// 在给定 `InstallLocation` 下解析商店版桌面端主程序，只返回 `ChatGPT.exe`。
+#[cfg(any(test, target_os = "windows"))]
+fn codex_store_gui_exe_in(install_location: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(relative) = appx_manifest_gui_executable(install_location) {
+        let candidate = install_location.join(relative.replace('/', "\\"));
+        if is_chatgpt_store_gui_exe(&candidate) && candidate.is_file() {
             return Some(candidate);
         }
     }
+
+    let fallback = install_location.join(CODEX_STORE_GUI_RELATIVE_EXE);
+    if is_chatgpt_store_gui_exe(&fallback) && fallback.is_file() {
+        return Some(fallback);
+    }
     None
 }
 
+/// 一个「当前用户已注册」的商店版 Codex 包。
 #[cfg(target_os = "windows")]
-fn detect_codex_exec_path_by_windowsapps_scan() -> Option<std::path::PathBuf> {
-    let mut best: Option<(u8, Vec<u32>, std::path::PathBuf)> = None;
-
-    for drive_root in windows_fixed_drive_roots() {
-        let drive_letter = drive_root.to_string_lossy().chars().next().unwrap_or('C');
-        let windows_apps_root = if drive_letter == 'C' {
-            drive_root.join("Program Files").join("WindowsApps")
-        } else {
-            drive_root.join("WindowsApps")
-        };
-        let root_path = windows_apps_root;
-        if !root_path.exists() {
-            continue;
-        }
-
-        let entries = match std::fs::read_dir(&root_path) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let file_type = match entry.file_type() {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-
-            let dir_name = entry.file_name();
-            let dir_name = dir_name.to_string_lossy();
-            let Some(version) = parse_codex_store_version_from_dir_name(&dir_name) else {
-                continue;
-            };
-            let package_priority = codex_store_package_priority(&dir_name);
-
-            let candidate = match find_codex_windows_app_main_exe(&entry.path().join("app")) {
-                Some(path) => path,
-                None => continue,
-            };
-
-            let replace = match &best {
-                None => true,
-                Some((best_priority, best_version, _)) => {
-                    package_priority > *best_priority
-                        || (package_priority == *best_priority
-                            && compare_windows_store_version(&version, best_version).is_gt())
-                }
-            };
-            if replace {
-                best = Some((package_priority, version, candidate));
-            }
-        }
-    }
-
-    if let Some((_, _, path)) = best {
-        crate::modules::logger::log_info(&format!(
-            "[Path Detect] codex windowsapps scan hit: {}",
-            path.to_string_lossy()
-        ));
-        return Some(path);
-    }
-
-    None
+struct CodexStorePackage {
+    family_name: String,
+    install_location: std::path::PathBuf,
 }
 
+/// 列出当前用户已注册的商店版 Codex 包（新版本优先）。
+///
+/// 只读包注册信息：不扫描 WindowsApps 目录（普通用户会被拒，且带 `-Filter` 时可能
+/// 静默返回空），也不依赖客户端是否正在运行。PFN 一并输出，便于日志和后续匹配。
 #[cfg(target_os = "windows")]
-fn detect_codex_exec_path_by_appx_install_location() -> Option<std::path::PathBuf> {
-    let script = r#"$names = @('OpenAI.ChatGPT', 'OpenAI.ChatGPT-Desktop', 'OpenAI.Codex')
-$pkg = $names |
-  ForEach-Object { Get-AppxPackage -Name $_ -ErrorAction SilentlyContinue } |
-  Sort-Object @{ Expression = { if ($_.Name -like 'OpenAI.ChatGPT*') { 0 } else { 1 } } }, @{ Expression = { $_.Version }; Descending = $true } |
-  Select-Object -First 1
-if (-not $pkg) {
-  $pkg = Get-AppxPackage |
+fn codex_store_packages() -> Vec<CodexStorePackage> {
+    let script = r#"$names = @('OpenAI.Codex', 'OpenAI.ChatGPT', 'OpenAI.ChatGPT-Desktop')
+$pkgs = @()
+foreach ($name in $names) {
+  $pkgs += @(Get-AppxPackage -Name $name -ErrorAction SilentlyContinue)
+}
+if ($pkgs.Count -eq 0) {
+  $pkgs = @(Get-AppxPackage -ErrorAction SilentlyContinue |
     Where-Object {
-      $_.Name -like 'OpenAI.ChatGPT*' -or
-      $_.Name -like 'OpenAI.Codex*' -or
-      $_.PackageFamilyName -like 'OpenAI.ChatGPT*' -or
-      $_.PackageFamilyName -like 'OpenAI.Codex*'
-    } |
-  Sort-Object @{ Expression = { if ($_.Name -like 'OpenAI.ChatGPT*' -or $_.PackageFamilyName -like 'OpenAI.ChatGPT*') { 0 } else { 1 } } }, @{ Expression = { $_.Version }; Descending = $true } |
-  Select-Object -First 1
+      $_.PackageFamilyName -like 'OpenAI.Codex*' -or
+      $_.PackageFamilyName -like 'OpenAI.ChatGPT*'
+    })
 }
-if ($pkg -and -not [string]::IsNullOrWhiteSpace($pkg.InstallLocation)) {
-  Write-Output ([string]$pkg.InstallLocation.Trim())
-}"#;
+$pkgs |
+  Where-Object { $_.InstallLocation -and $_.PackageFamilyName } |
+  Sort-Object -Property @{ Expression = { $_.Version }; Descending = $true } |
+  ForEach-Object { Write-Output ([string]$_.PackageFamilyName + '|' + [string]$_.InstallLocation.Trim()) }"#;
 
-    let output =
+    let mut packages = Vec::new();
+    let Ok(output) =
         powershell_output_with_timeout(&["-Command", script], WINDOWS_PROCESS_PROBE_TIMEOUT)
-            .ok()?;
+    else {
+        crate::modules::logger::log_warn(
+            "[Path Detect] 读取商店包注册信息失败（PowerShell 调用失败）",
+        );
+        return packages;
+    };
     if !output.status.success() {
-        return None;
+        crate::modules::logger::log_warn(&format!(
+            "[Path Detect] 读取商店包注册信息失败: status={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+        return packages;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        let install_location = line.trim().trim_matches('"');
-        if install_location.is_empty() {
+        let line = line.trim().trim_matches('"');
+        if line.is_empty() {
             continue;
         }
-        let Some(candidate) = find_codex_windows_app_main_exe(
-            &std::path::PathBuf::from(install_location).join("app"),
-        ) else {
+        let Some((family_name, install_location)) = line.split_once('|') else {
             continue;
         };
-        if candidate.exists() {
-            crate::modules::logger::log_info(&format!(
-                "[Path Detect] codex appx install hit: {}",
-                candidate.to_string_lossy()
-            ));
-            return Some(candidate);
+        let family_name = family_name.trim();
+        let install_location = install_location.trim();
+        if family_name.is_empty() || install_location.is_empty() {
+            continue;
         }
+        packages.push(CodexStorePackage {
+            family_name: family_name.to_string(),
+            install_location: std::path::PathBuf::from(install_location),
+        });
+    }
+    packages
+}
+
+/// 解析「当前用户已注册的商店版 Codex 桌面端」主程序路径，只返回 `ChatGPT.exe`。
+#[cfg(target_os = "windows")]
+fn detect_codex_store_gui_exe() -> Option<std::path::PathBuf> {
+    for package in codex_store_packages() {
+        if let Some(exe) = codex_store_gui_exe_in(&package.install_location) {
+            crate::modules::logger::log_info(&format!(
+                "[Path Detect] codex store hit: pfn={} install_location={} exe={}",
+                package.family_name,
+                package.install_location.to_string_lossy(),
+                exe.to_string_lossy()
+            ));
+            return Some(exe);
+        }
+        crate::modules::logger::log_warn(&format!(
+            "[Path Detect] 商店包 {} 的安装目录里没有 ChatGPT.exe: {}",
+            package.family_name,
+            package.install_location.to_string_lossy()
+        ));
     }
     None
 }
@@ -2519,6 +2503,214 @@ Start-Process -FilePath $exe{argument_list} -ErrorAction Stop | Out-Null"#,
     Ok(())
 }
 
+/// 按 `CreateProcess` 的解析规则引用单个 Windows 命令行参数。
+///
+/// Electron 的启动参数常含空格与引号（`--user-data-dir=C:\Users\some user\...`），
+/// 拼进 `ProcessStartInfo.Arguments` 时必须按同一套规则转义，否则会被拆成多个参数。
+#[cfg(any(test, target_os = "windows"))]
+fn quote_windows_command_argument(argument: &str) -> String {
+    if !argument.is_empty() && !argument.contains([' ', '\t', '\n', '\u{b}', '"']) {
+        return argument.to_string();
+    }
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('"');
+    let mut pending_backslashes = 0usize;
+    for ch in argument.chars() {
+        match ch {
+            '\\' => pending_backslashes += 1,
+            '"' => {
+                // 引号前的反斜杠要加倍，引号自身再转义一个。
+                for _ in 0..(pending_backslashes * 2 + 1) {
+                    quoted.push('\\');
+                }
+                quoted.push('"');
+                pending_backslashes = 0;
+            }
+            _ => {
+                for _ in 0..pending_backslashes {
+                    quoted.push('\\');
+                }
+                pending_backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    // 结尾反斜杠必须加倍，否则会把收尾引号转义掉。
+    for _ in 0..(pending_backslashes * 2) {
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// 从商店包启动路径反推包的 `InstallLocation`。
+///
+/// 启动路径形如 `<InstallLocation>\app\ChatGPT.exe`，因此去掉两级即安装根目录；
+/// 非商店路径返回 `None`。
+///
+/// 这里按文本解析而不是 `Path::parent()`：该函数只处理 Windows 路径，而
+/// `Path::parent()` 在非 Windows 主机（单元测试）上不会把 `\` 当分隔符。
+#[cfg(any(test, target_os = "windows"))]
+fn windowsapps_install_location_from_launch_path(launch_path: &Path) -> Option<String> {
+    if !is_windowsapps_launch_path(launch_path) {
+        return None;
+    }
+    let normalized = launch_path.to_string_lossy().replace('/', "\\");
+    let trimmed = normalized.trim_end_matches('\\');
+    let install_location = trimmed.rsplitn(3, '\\').nth(2)?;
+    let text = install_location.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// 把脚本编码成 `powershell.exe -EncodedCommand` 需要的 UTF-16LE + Base64。
+///
+/// 内层脚本里既有中文错误文案又有引号与反斜杠，直接用 `-Command` 传会被外层
+/// 解析一次、内层再解析一次，`-EncodedCommand` 可以完全绕开这层转义问题。
+#[cfg(target_os = "windows")]
+fn encode_powershell_encoded_command(script: &str) -> String {
+    use base64::{engine::general_purpose, Engine as _};
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    general_purpose::STANDARD.encode(bytes)
+}
+
+/// 用**包身份**（`Invoke-CommandInDesktopPackage`）启动商店版 Codex 受管实例。
+///
+/// Windows 会拒绝包外进程直接执行 `C:\Program Files\WindowsApps\...` 里的可执行文件
+/// （`os error 5` / `Access is denied`），PowerShell 的 `Start-Process` 同样被拒——两者
+/// 都是同一层内核检查，换启动器没有用。而 `shell:AppsFolder` 系统入口虽然能起进程，
+/// 却无法传递 `CODEX_HOME`，会把受管实例指到默认账号上（因此不能作为兜底）。
+///
+/// 这里的做法是：以该包的身份激活一个 `powershell.exe`，在其中设置好环境变量后，
+/// 用 `ProcessStartInfo`（`UseShellExecute = $false`）拉起官方客户端。子进程继承该
+/// 进程的环境，所以 `CODEX_HOME`、隔离的 user-data 目录以及临时登录注入用的
+/// `NODE_OPTIONS` 都能完整传到官方进程。
+///
+/// 注意：`Start-Process` 在这里**不可用**——它走 `ShellExecuteEx`，会丢掉自定义环境变量，
+/// 表现为客户端起来了但读的还是默认账号（实测注入脚本不执行、`CODEX_HOME` 为空）。
+#[cfg(target_os = "windows")]
+fn launch_codex_via_package_identity(
+    launch_path: &Path,
+    codex_home: &str,
+    app_user_data_dir: &Path,
+    extra_args: &[String],
+    extra_env: &[(String, String)],
+) -> Result<(), String> {
+    let Some(install_location) = windowsapps_install_location_from_launch_path(launch_path) else {
+        return Err("启动路径不在 WindowsApps 商店包目录内，无法使用包身份启动".to_string());
+    };
+
+    let mut env_pairs: Vec<(String, String)> = managed_proxy_env_pairs()
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+    env_pairs.push(("CODEX_HOME".to_string(), codex_home.to_string()));
+    env_pairs.push((
+        "CODEX_ELECTRON_USER_DATA_PATH".to_string(),
+        app_user_data_dir.to_string_lossy().to_string(),
+    ));
+    // 临时登录的主进程注入（NODE_OPTIONS）必须一起传下去，否则官方客户端不会
+    // 把授权地址写进采集文件，用户点了「继续登录」只会看到浏览器被打开。
+    for (key, value) in extra_env {
+        env_pairs.push((key.clone(), value.clone()));
+    }
+
+    let mut launch_args = build_codex_app_launch_args(extra_args);
+    launch_args.push(format!(
+        "--user-data-dir={}",
+        app_user_data_dir.to_string_lossy()
+    ));
+    let argument_line = launch_args
+        .iter()
+        .map(|arg| quote_windows_command_argument(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let env_lines = env_pairs
+        .into_iter()
+        .map(|(key, value)| {
+            format!(
+                "$env:{} = '{}'",
+                key,
+                escape_powershell_single_quoted(&value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let inner_script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+{env_lines}
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = '{exe}'
+$psi.UseShellExecute = $false
+$psi.Arguments = '{arguments}'
+[void][System.Diagnostics.Process]::Start($psi)"#,
+        env_lines = env_lines,
+        exe = escape_powershell_single_quoted(&launch_path.to_string_lossy()),
+        arguments = escape_powershell_single_quoted(&argument_line),
+    );
+    let encoded_command = encode_powershell_encoded_command(&inner_script);
+
+    // 外层按启动路径解析出真正注册的包与 AppId，避免版本目录与注册信息不一致时
+    // 起错包（与 refresh_registered_codex_store_launch_path 的取向一致）。
+    let outer_script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+if (-not (Get-Command Invoke-CommandInDesktopPackage -ErrorAction SilentlyContinue)) {{
+  throw '当前系统不支持 Invoke-CommandInDesktopPackage（需要 Windows 10 1809 及以上）'
+}}
+$installLocation = '{install_location}'
+$installLeaf = Split-Path -Leaf $installLocation
+$pkg = Get-AppxPackage |
+  Where-Object {{ $_.InstallLocation -and ((Split-Path -Leaf $_.InstallLocation) -ieq $installLeaf) }} |
+  Select-Object -First 1
+if (-not $pkg) {{
+  $normalizedInstall = [System.IO.Path]::GetFullPath($installLocation).TrimEnd('\')
+  $pkg = Get-AppxPackage |
+    Where-Object {{
+      $_.InstallLocation -and (
+        ([System.IO.Path]::GetFullPath($_.InstallLocation).TrimEnd('\')) -ieq $normalizedInstall
+      )
+    }} |
+    Select-Object -First 1
+}}
+if (-not $pkg) {{ throw "未找到与启动路径匹配的已注册商店包: $installLocation" }}
+$appId = 'App'
+try {{
+  $application = (Get-AppxPackageManifest -Package $pkg).Package.Applications.Application |
+    Select-Object -First 1
+  if ($application -and -not [string]::IsNullOrWhiteSpace($application.Id)) {{
+    $appId = [string]$application.Id
+  }}
+}} catch {{}}
+Invoke-CommandInDesktopPackage -PackageFamilyName $pkg.PackageFamilyName -AppId $appId -Command 'powershell.exe' -Args '-NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}'"#,
+        install_location = escape_powershell_single_quoted(&install_location),
+        encoded = encoded_command,
+    );
+
+    let output = powershell_output(&["-Command", &outer_script])
+        .map_err(|e| format!("包身份启动调用失败: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_head = stderr.trim().chars().take(400).collect::<String>();
+        return Err(format!(
+            "包身份启动失败: status={}, stderr={}",
+            output.status,
+            if stderr_head.is_empty() {
+                "<empty>".to_string()
+            } else {
+                stderr_head
+            }
+        ));
+    }
+    Ok(())
+}
+
 const CODEX_MANAGED_STORE_LAUNCH_UNSAFE_PREFIX: &str = "CODEX_MANAGED_STORE_LAUNCH_UNSAFE:";
 
 fn codex_managed_store_launch_unsafe_error(
@@ -2550,7 +2742,7 @@ fn refresh_registered_codex_store_launch_path(
     if !is_windowsapps_launch_path(current) {
         return None;
     }
-    let registered = detect_codex_exec_path_by_appx_install_location()?;
+    let registered = detect_codex_store_gui_exe()?;
     if normalized_windows_path_text(&registered) == normalized_windows_path_text(current) {
         return None;
     }
@@ -2564,7 +2756,7 @@ fn codex_managed_store_launch_diagnostics(launch_path: &Path, codex_home: &str) 
         format!("launch_path={}", launch_path.to_string_lossy()),
         format!("launch_path_exists={}", launch_path.exists()),
     ];
-    match detect_codex_exec_path_by_appx_install_location() {
+    match detect_codex_store_gui_exe() {
         Some(registered) => {
             parts.push(format!("registered_path={}", registered.to_string_lossy()));
             parts.push(format!(
@@ -2597,12 +2789,9 @@ pub(crate) fn detect_codex_exec_path() -> Option<std::path::PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        // 先读当前用户「已注册」的商店包：WindowsApps 目录扫描只看目录名里的版本号，
-        // 可能命中其它 Windows 账户或已卸载包残留的更高版本目录，随后启动会 os error 5。
-        if let Some(path) = detect_codex_exec_path_by_appx_install_location() {
-            return Some(path);
-        }
-        if let Some(path) = detect_codex_exec_path_by_windowsapps_scan() {
+        // 只按当前用户「已注册」的商店包解析：不扫描 WindowsApps 目录（普通用户会被拒，
+        // 带 -Filter 的枚举还可能静默返回空），也不依赖客户端此刻是否正在运行。
+        if let Some(path) = detect_codex_store_gui_exe() {
             return Some(path);
         }
     }
@@ -2656,6 +2845,9 @@ fn linux_codex_discovery_paths(
     candidates
 }
 
+/// macOS / Linux 的启动路径探测并写回；Windows 走 `resolve_codex_launch_path` 里的
+/// 「商店包解析 + 写回」分支，不再需要这个包装函数。
+#[cfg(not(target_os = "windows"))]
 fn detect_and_save_codex_launch_path() -> Option<std::path::PathBuf> {
     let expected_current = config::get_user_config().codex_app_path;
     let detected = detect_codex_exec_path()?;
@@ -3254,13 +3446,51 @@ fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
     Err(app_path_missing_error("codex"))
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows：解析 Codex 桌面端启动路径。
+///
+/// 规则（按优先级）：
+/// 1. 配置里的启动路径存在 → 直接使用（含用户手填的 npm 版 CLI）。
+/// 2. 未配置或路径已经不可用 → 按当前用户已注册的商店包解析
+///    （PFN → InstallLocation → 清单里的 `Executable`），解析成功即**写回配置**作为新的启动路径。
+///    商店更新换目录后旧目录若还在但已不能执行，由启动失败后的重新解析兜底。
+/// 3. 商店包解析不到 → 遗留商店路径迁移（旧版 `Codex.exe` → `ChatGPT.exe`）。
+///
+/// 全程只读包注册信息：不扫描 WindowsApps 目录（普通用户会被拒，带 `-Filter` 的枚举
+/// 还可能静默返回空），也不依赖客户端是否正在运行；只接受 `ChatGPT.exe`。
+#[cfg(target_os = "windows")]
+fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
+    let configured = config::get_user_config().codex_app_path;
+    let configured_path = normalize_custom_path(Some(&configured)).map(std::path::PathBuf::from);
+
+    if let Some(path) = configured_path.as_deref() {
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+        crate::modules::logger::log_warn(&format!(
+            "[Codex Start] 配置的启动路径已失效，准备重新探测: {}",
+            path.to_string_lossy()
+        ));
+    }
+
+    if let Some(detected) = detect_codex_store_gui_exe() {
+        update_app_path_in_config("codex", &detected, &configured);
+        crate::modules::logger::log_info(&format!(
+            "[Codex Start] 已自动探测并写回 Codex 启动路径: {}",
+            detected.to_string_lossy()
+        ));
+        return Ok(detected);
+    }
+
+    if let Some(migrated) = migrate_legacy_codex_launch_path(&configured) {
+        return Ok(migrated);
+    }
+
+    Err(app_path_missing_error("codex"))
+}
+
+#[cfg(target_os = "linux")]
 fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
     if let Some(custom) = normalize_custom_path(Some(&config::get_user_config().codex_app_path)) {
-        #[cfg(target_os = "windows")]
-        if let Some(migrated) = migrate_legacy_codex_launch_path(&custom) {
-            return Ok(migrated);
-        }
         if let Some(exec) = resolve_macos_exec_path(&custom, "Codex") {
             return Ok(exec);
         }
@@ -3270,11 +3500,8 @@ fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
         return Err(app_path_missing_error("codex"));
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    {
-        if let Some(detected) = detect_and_save_codex_launch_path() {
-            return Ok(detected);
-        }
+    if let Some(detected) = detect_and_save_codex_launch_path() {
+        return Ok(detected);
     }
 
     Err(app_path_missing_error("codex"))
