@@ -168,6 +168,7 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
 >) {
   const {
     accountIdLabel,
+    activeGroupId,
     addingLocalAccessAccountId,
     apiKeyUsageDetailAccount,
     apiKeyUsageMap,
@@ -193,6 +194,7 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
     formatApiKeyUsageQuotaValue,
     formatDate,
     getCodexSwitchOrLaunchBlockedReason,
+    groupByTag,
     handleAccountNameDoubleClick,
     handleAddLocalAccessAccount,
     handleCopyLocalAccessValue,
