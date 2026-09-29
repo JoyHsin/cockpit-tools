@@ -447,7 +447,7 @@
     }
 
     #[test]
-    fn deepseek_compaction_fallback_round_trips_user_values() {
+    fn deepseek_overrides_do_not_add_compaction_features() {
         let base_dir = make_temp_dir("codex-deepseek-compaction-fallback");
         let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(
             "model = \"gpt-5\"\n\n[features]\njs_repl = false\n",
@@ -455,8 +455,7 @@
         .expect("parse config");
         super::apply_deepseek_config_overrides(&mut doc, &base_dir);
         let applied = crate::modules::codex_config_format::codex_config_doc_to_string(&mut doc);
-        assert!(applied.contains("remote_compaction_v2 = false"));
-        // `token_budget = true` 会让客户端把压缩换成不产摘要的窗口重置，必须保持清除状态。
+        assert!(!applied.contains("remote_compaction_v2"));
         assert!(!applied.contains("token_budget"));
         assert!(applied.contains("js_repl = false"));
 
@@ -469,7 +468,7 @@
     }
 
     #[test]
-    fn deepseek_compaction_fallback_restores_original_user_settings() {
+    fn deepseek_overrides_preserve_unmanaged_user_features() {
         let base_dir = make_temp_dir("codex-deepseek-compaction-restore");
         let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(
             "[features]\nremote_compaction_v2 = true\ntoken_budget = false\n",
@@ -477,14 +476,120 @@
         .expect("parse config");
         super::apply_deepseek_config_overrides(&mut doc, &base_dir);
         let applied = crate::modules::codex_config_format::codex_config_doc_to_string(&mut doc);
-        assert!(applied.contains("remote_compaction_v2 = false"));
-        assert!(!applied.contains("token_budget"));
+        assert!(applied.contains("remote_compaction_v2 = true"));
+        assert!(applied.contains("token_budget = false"));
 
         assert!(super::restore_deepseek_config_overrides(&mut doc, &base_dir));
         let restored = crate::modules::codex_config_format::codex_config_doc_to_string(&mut doc);
         assert!(restored.contains("remote_compaction_v2 = true"));
         assert!(restored.contains("token_budget = false"));
         fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn deepseek_legacy_backup_never_replays_removed_compaction_flag() {
+        for (backup_remote, current_remote, current_budget, expected_remote, expected_budget) in [
+            (Some(true), Some(false), None, None, Some(false)),
+            (None, Some(false), None, None, Some(false)),
+            (Some(false), Some(false), None, Some(false), None),
+            (Some(true), None, None, None, None),
+            (Some(true), Some(true), None, Some(true), None),
+            (Some(true), Some(false), Some(true), None, Some(true)),
+            (
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+            ),
+        ] {
+            let base_dir = make_temp_dir("codex-deepseek-legacy-backup");
+            let remote_record = match backup_remote {
+                Some(value) => serde_json::json!({"present": true, "value": value}),
+                None => serde_json::json!({"present": false}),
+            };
+            fs::write(
+                base_dir.join(super::DEEPSEEK_COMPACTION_BACKUP_FILE),
+                serde_json::json!({"remote_compaction_v2": remote_record,
+                    "token_budget": {"present": true, "value": false}})
+                .to_string(),
+            )
+            .expect("write legacy backup");
+            let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(
+                "[features]\njs_repl = false\n",
+            )
+            .expect("parse config");
+            if let Some(value) = current_remote {
+                doc["features"]["remote_compaction_v2"] = toml_edit::value(value);
+            }
+            if let Some(value) = current_budget {
+                doc["features"]["token_budget"] = toml_edit::value(value);
+            }
+            assert!(super::restore_deepseek_config_overrides(
+                &mut doc, &base_dir
+            ));
+            assert_eq!(
+                doc["features"]
+                    .get("remote_compaction_v2")
+                    .and_then(|item| item.as_bool()),
+                expected_remote
+            );
+            assert_eq!(
+                doc["features"]
+                    .get("token_budget")
+                    .and_then(|item| item.as_bool()),
+                expected_budget
+            );
+            assert_eq!(doc["features"]["js_repl"].as_bool(), Some(false));
+            assert!(!base_dir
+                .join(super::DEEPSEEK_COMPACTION_BACKUP_FILE)
+                .exists());
+            fs::remove_dir_all(base_dir).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn deepseek_legacy_backup_is_retained_until_restore() {
+        let base_dir = make_temp_dir("codex-deepseek-legacy-restore");
+        let backup_path = base_dir.join(super::DEEPSEEK_COMPACTION_BACKUP_FILE);
+        let backup = r#"{"remote_compaction_v2":{"present":true,"value":true},"token_budget":{"present":true,"value":false}}"#;
+        fs::write(&backup_path, backup).expect("write legacy backup");
+        let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(
+            "web_search = \"live\"\n[features]\nremote_compaction_v2 = false\n",
+        )
+        .expect("parse config");
+        super::apply_deepseek_config_overrides(&mut doc, &base_dir);
+        assert_eq!(
+            fs::read_to_string(&backup_path).expect("read legacy backup"),
+            backup
+        );
+        assert_eq!(
+            doc["features"]["remote_compaction_v2"].as_bool(),
+            Some(false)
+        );
+        assert!(doc["features"].get("token_budget").is_none());
+        assert!(super::restore_deepseek_config_overrides(
+            &mut doc, &base_dir
+        ));
+        assert!(doc["features"].get("remote_compaction_v2").is_none());
+        assert_eq!(doc["features"]["token_budget"].as_bool(), Some(false));
+        assert!(!backup_path.exists());
+        // 旧备份消费后，用户重新写值、删除 token_budget，后续切号必须保留。
+        doc["features"]["remote_compaction_v2"] = toml_edit::value(false);
+        doc["features"]
+            .as_table_mut()
+            .expect("features")
+            .remove("token_budget");
+        super::apply_deepseek_config_overrides(&mut doc, &base_dir);
+        assert!(super::restore_deepseek_config_overrides(
+            &mut doc, &base_dir
+        ));
+        assert_eq!(
+            doc["features"]["remote_compaction_v2"].as_bool(),
+            Some(false)
+        );
+        assert!(doc["features"].get("token_budget").is_none());
+        fs::remove_dir_all(base_dir).expect("cleanup");
     }
 
     #[test]
@@ -504,7 +609,7 @@
 
         assert!(super::reapply_deepseek_config_overrides_for_dir(&base_dir).expect("reapply"));
         let applied = fs::read_to_string(&config_path).expect("read config");
-        assert!(applied.contains("remote_compaction_v2 = false"));
+        assert!(!applied.contains("remote_compaction_v2"));
         assert!(!applied.contains("token_budget"));
         assert!(applied.contains("js_repl = false"));
         assert!(applied.contains("name = \"OpenAI\""));
@@ -526,59 +631,30 @@
     }
 
     #[test]
-    fn local_compaction_fallback_forwards_profile_and_is_idempotent() {
-        let base_dir = make_temp_dir("codex-local-compaction-fallback");
-        // 接管还没写入 profile 配置时跳过，避免生成没有 provider 的残缺配置。
-        assert!(!super::ensure_local_compaction_fallback_for_dir(&base_dir).expect("skip missing"));
-
-        let config_path = super::get_config_toml_path(&base_dir);
-        crate::modules::codex_config_format::write_codex_config_toml_atomic(
-            &config_path,
-            "model = \"gpt-5.6-sol\"\nservice_tier = \"priority\"\nweb_search = \"live\"\n\n[features]\njs_repl = false\n\n[model_providers.codex_local_access]\nname = \"OpenAI\"\n",
-        )
-        .expect("write config");
-
-        assert!(super::ensure_local_compaction_fallback_for_dir(&base_dir).expect("apply"));
-        let applied = fs::read_to_string(&config_path).expect("read config");
-        assert!(applied.contains("remote_compaction_v2 = false"));
-        assert!(!applied.contains("token_budget"));
-        // 只动压缩键：账号池里的官方账号仍要保留 service_tier / web_search 等原有设置。
-        assert!(applied.contains("service_tier = \"priority\""));
-        assert!(applied.contains("web_search = \"live\""));
-        assert!(!applied.contains("web_search = \"disabled\""));
-
-        assert!(!super::ensure_local_compaction_fallback_for_dir(&base_dir).expect("idempotent"));
-        assert_eq!(
-            fs::read_to_string(&config_path).expect("read config"),
-            applied
-        );
-        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    fn legacy_compaction_cleanup_preserves_other_features_and_is_idempotent() {
+        let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(
+            "model = \"gpt-5\"\nservice_tier = \"priority\"\n[features]\nremote_compaction_v2 = false\ntoken_budget = true\njs_repl = false\n",
+        ).expect("parse legacy managed config");
+        assert!(super::remove_legacy_remote_compaction_override(&mut doc));
+        assert!(!super::remove_legacy_remote_compaction_override(&mut doc));
+        assert_eq!(doc["features"]["token_budget"].as_bool(), Some(true));
+        assert_eq!(doc["features"]["js_repl"].as_bool(), Some(false));
+        assert_eq!(doc["service_tier"].as_str(), Some("priority"));
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
     }
 
     #[test]
-    fn local_compaction_fallback_clears_legacy_token_budget_override() {
-        let base_dir = make_temp_dir("codex-local-compaction-legacy-cleanup");
-        let config_path = super::get_config_toml_path(&base_dir);
-        // 复现 1.3.54 / 1.3.55 写下的受管状态：远端压缩关闭 + token_budget 打开（换窗口模式）。
-        crate::modules::codex_config_format::write_codex_config_toml_atomic(
-            &config_path,
-            "model = \"gpt-5.6-sol\"\n\n[features]\nremote_compaction_v2 = false\ntoken_budget = true\njs_repl = false\n",
-        )
-        .expect("write config");
-
-        assert!(super::ensure_local_compaction_fallback_for_dir(&base_dir).expect("apply"));
-        let applied = fs::read_to_string(&config_path).expect("read config");
-        assert!(applied.contains("remote_compaction_v2 = false"));
-        assert!(!applied.contains("token_budget"));
-        assert!(applied.contains("js_repl = false"));
-
-        // 清理后保持幂等，避免每次启动都改写配置。
-        assert!(!super::ensure_local_compaction_fallback_for_dir(&base_dir).expect("idempotent"));
-        assert_eq!(
-            fs::read_to_string(&config_path).expect("read config"),
-            applied
-        );
-        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    fn legacy_compaction_cleanup_does_not_create_or_overwrite_features() {
+        for config in [
+            "",
+            "[features]\nremote_compaction_v2 = true\ntoken_budget = false\n",
+        ] {
+            let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(config)
+                .expect("parse config");
+            let before = doc.to_string();
+            assert!(!super::remove_legacy_remote_compaction_override(&mut doc));
+            assert_eq!(doc.to_string(), before);
+        }
     }
 
     #[test]
@@ -715,6 +791,403 @@
             .join(super::CODEX_MANAGED_MODEL_CATALOG_FILE)
             .exists());
         fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    fn assert_builtin_provider_config(content: &str) {
+        let doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(content)
+            .expect("parse builtin provider config");
+        let expected = if cfg!(target_os = "windows") {
+            Some("openai")
+        } else {
+            None
+        };
+        assert_eq!(
+            doc.get("model_provider").and_then(|item| item.as_str()),
+            expected
+        );
+        assert!(doc.get("model_providers").is_none(), "config: {content}");
+    }
+
+    /// 通用回归：工具写入的第三方 provider 引用必须在切回官方账号时还原。
+    ///
+    /// 官方账号投影只清理受管 provider（`openai` / `codex_local_access` / ...），并把其余 id 当作
+    /// 用户自定义 provider 保留——工具自己写给供应商账号的 `model_provider` 因此会残留，
+    /// 表现为「账号已经切回普通账号，客户端仍按上一个供应商发请求」。这里用非 DeepSeek 的自建
+    /// 中转验证机制是通用的，而不是按供应商 id 写特判。
+    #[test]
+    fn official_account_switch_restores_supplier_provider_snapshot() {
+        let base_dir = make_temp_dir("codex-provider-override-snapshot");
+        let config_path = base_dir.join("config.toml");
+        fs::write(&config_path, "model = \"gpt-5.5\"\n").expect("write official config");
+
+        let relay_config = resolve_api_provider_config(
+            Some("https://relay.example.com/v1"),
+            Some(CodexApiProviderMode::Custom),
+            Some("relay"),
+            Some("Relay"),
+        )
+        .expect("resolve relay config");
+        super::write_api_provider_to_config_toml_with_options(&base_dir, &relay_config, false)
+            .expect("write relay provider");
+
+        let relay_content = fs::read_to_string(&config_path).expect("read relay config");
+        assert!(relay_content.contains("model_provider = \"relay\""));
+        assert!(relay_content.contains("[model_providers.relay]"));
+        assert!(base_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE).is_file());
+
+        let official_config =
+            resolve_api_provider_config(None, Some(CodexApiProviderMode::OpenaiBuiltin), None, None)
+                .expect("resolve official config");
+        super::write_api_provider_to_config_toml_with_options(&base_dir, &official_config, false)
+            .expect("write official provider");
+
+        let content = fs::read_to_string(&config_path).expect("read official config");
+        assert_builtin_provider_config(&content);
+        assert!(!content.contains("relay.example.com"), "config: {content}");
+        assert!(content.contains("model = \"gpt-5.5\""), "config: {content}");
+        assert!(
+            !base_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE).exists(),
+            "快照只服务一次还原"
+        );
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn provider_snapshot_preserves_manual_provider_and_model_changes() {
+        for manual_provider in [Some("myrelay"), None] {
+            let base_dir = make_temp_dir("codex-provider-snapshot-manual-change");
+            let config_path = base_dir.join("config.toml");
+            fs::write(&config_path, "model = \"gpt-5.5\"\n").expect("write original config");
+            let relay = resolve_api_provider_config(
+                Some("https://relay.example.com/v1"),
+                Some(CodexApiProviderMode::Custom),
+                Some("relay"),
+                Some("Relay"),
+            )
+            .expect("resolve relay");
+            super::write_api_provider_to_config_toml_with_options(&base_dir, &relay, false)
+                .expect("write relay config and snapshot");
+            assert!(base_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE).is_file());
+
+            // Simulate a later user edit, including selecting the implicit builtin provider.
+            let current = fs::read_to_string(&config_path).expect("read relay config");
+            let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(&current)
+                .expect("parse relay config");
+            doc["model"] = toml_edit::value("gpt-6-sol");
+            if let Some(provider) = manual_provider {
+                doc["model_provider"] = toml_edit::value(provider);
+                doc["model_providers"][provider] = toml_edit::table();
+                doc["model_providers"][provider]["name"] = toml_edit::value("My Relay");
+                doc["model_providers"][provider]["base_url"] =
+                    toml_edit::value("https://myrelay.example.com/v1");
+                doc["model_providers"][provider]["wire_api"] = toml_edit::value("responses");
+            } else {
+                doc.remove("model_provider");
+            }
+            fs::write(
+                &config_path,
+                crate::modules::codex_config_format::codex_config_doc_to_string(&mut doc),
+            )
+            .expect("write user's provider and model");
+
+            let official = resolve_api_provider_config(
+                None,
+                Some(CodexApiProviderMode::OpenaiBuiltin),
+                None,
+                None,
+            )
+            .expect("resolve builtin");
+            super::write_api_provider_to_config_toml_with_options(&base_dir, &official, false)
+                .expect("switch to official account");
+            let content = fs::read_to_string(&config_path).expect("read final config");
+            let doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(&content)
+                .expect("parse final config");
+            let expected_provider = manual_provider.or_else(|| {
+                if cfg!(target_os = "windows") {
+                    Some("openai")
+                } else {
+                    None
+                }
+            });
+            assert_eq!(
+                doc.get("model_provider").and_then(|item| item.as_str()),
+                expected_provider
+            );
+            assert_eq!(doc["model"].as_str(), Some("gpt-6-sol"));
+            if let Some(provider) = manual_provider {
+                assert_eq!(
+                    doc["model_providers"][provider]["base_url"].as_str(),
+                    Some("https://myrelay.example.com/v1"),
+                );
+            }
+            assert!(!base_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE).exists());
+            fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+        }
+    }
+
+    #[test]
+    fn provider_snapshot_restores_original_user_provider_from_legacy_snapshot() {
+        let base_dir = make_temp_dir("codex-provider-snapshot-legacy-user-provider");
+        let config_path = base_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "deepseek-v4-pro"
+model_provider = "deepseek"
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+wire_api = "responses"
+[model_providers.myrelay]
+name = "My Relay"
+base_url = "https://myrelay.example.com/v1"
+wire_api = "responses"
+"#,
+        )
+        .expect("write supplier config");
+        fs::write(
+            base_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE),
+            r#"{
+  "providerId": "deepseek",
+  "model": "gpt-5.5",
+  "modelProvider": "myrelay",
+  "providerTable": null
+}"#,
+        )
+        .expect("write existing snapshot format");
+        let official =
+            resolve_api_provider_config(None, Some(CodexApiProviderMode::OpenaiBuiltin), None, None)
+                .expect("resolve builtin");
+
+        super::write_api_provider_to_config_toml_with_options(&base_dir, &official, false)
+            .expect("restore original user provider");
+        let content = fs::read_to_string(&config_path).expect("read restored config");
+        let doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(&content)
+            .expect("parse restored config");
+        assert_eq!(doc["model_provider"].as_str(), Some("myrelay"));
+        assert_eq!(doc["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(
+            doc["model_providers"]["myrelay"]["base_url"].as_str(),
+            Some("https://myrelay.example.com/v1")
+        );
+        assert!(doc["model_providers"].get("deepseek").is_none());
+        assert!(!base_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE).exists());
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    /// 没有工具快照时，用户自己配置的 provider 必须原样保留（不能被通用还原误删）。
+    #[test]
+    fn official_account_switch_keeps_user_owned_provider_without_snapshot() {
+        let base_dir = make_temp_dir("codex-provider-override-user-owned");
+        let config_path = base_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "gpt-5.5"
+model_provider = "myrelay"
+
+[model_providers.myrelay]
+name = "My Relay"
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#,
+        )
+        .expect("write custom provider config");
+
+        let official_config =
+            resolve_api_provider_config(None, Some(CodexApiProviderMode::OpenaiBuiltin), None, None)
+                .expect("resolve official config");
+        super::write_api_provider_to_config_toml_with_options(&base_dir, &official_config, false)
+            .expect("write official provider");
+
+        let content = fs::read_to_string(&config_path).expect("read config");
+        assert!(content.contains("model_provider = \"myrelay\""));
+        assert!(content.contains("[model_providers.myrelay]"));
+        assert!(content.contains("model = \"gpt-5.5\""));
+
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    /// 连续切号回归：受管 API Key → DeepSeek → OAuth 不得恢复已删除的运行时 provider。
+    #[test]
+    fn provider_snapshot_oauth_bundle_after_deepseek_drops_managed_providers() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let env = TestEnvGuard::new("codex-deepseek-switch-back-oauth");
+        let oauth_account = seed_oauth_account(make_codex_tokens(
+            "demo@example.com",
+            "acc-current",
+            "org-current",
+            "deepseek-switch-back",
+            "rt-deepseek-switch-back",
+        ));
+
+        let mut deepseek_account = CodexAccount::new_api_key(
+            "deepseek-switch-back-key".to_string(),
+            "deepseek-switch-back@example.com".to_string(),
+            "sk-deepseek-switch-back".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.deepseek.com".to_string()),
+            Some("deepseek".to_string()),
+            Some("DeepSeek".to_string()),
+            vec!["deepseek-v4-pro".to_string()],
+        );
+        deepseek_account.api_wire_api = Some("responses".to_string());
+        deepseek_account.api_sync_model_catalog_to_codex = true;
+        deepseek_account.api_instance_access_mode = Some("cdp".to_string());
+        deepseek_account.api_startup_model = Some("deepseek-v4-pro".to_string());
+
+        for (access_mode, start_with_managed_provider) in
+            [("direct", false), ("direct", true), ("cdp", false), ("cdp", true)]
+        {
+            deepseek_account.api_instance_access_mode = Some(access_mode.to_string());
+            let profile_dir = env
+                .home_dir
+                .join(format!("managed-profile-{access_mode}-{start_with_managed_provider}"));
+            if start_with_managed_provider {
+                let mut relay_account = CodexAccount::new_api_key(
+                    "relay-before-deepseek".to_string(),
+                    "relay@example.com".to_string(),
+                    "sk-relay-before-deepseek".to_string(),
+                    CodexApiProviderMode::Custom,
+                    Some("https://relay.example.com/v1".to_string()),
+                    Some("relay".to_string()),
+                    Some("Relay".to_string()),
+                    vec!["gpt-5.5".to_string()],
+                );
+                relay_account.api_wire_api = Some("responses".to_string());
+                relay_account.api_supports_websockets = false;
+                write_account_bundle_to_dir(&profile_dir, &relay_account).expect("write relay bundle");
+                let relay_config = fs::read_to_string(profile_dir.join("config.toml")).unwrap();
+                assert!(relay_config.contains("model_provider = \"codex_local_access\""));
+            }
+            write_account_bundle_to_dir(&profile_dir, &deepseek_account)
+                .expect("write deepseek bundle");
+            let deepseek_config = fs::read_to_string(profile_dir.join("config.toml")).unwrap();
+            assert!(deepseek_config.contains("model_provider = \"deepseek\""));
+            assert!(deepseek_config.contains("[model_providers.deepseek]"));
+            if start_with_managed_provider {
+                let snapshot: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(profile_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE)).unwrap(),
+                )
+                .expect("read provider snapshot");
+                assert_eq!(snapshot["modelProvider"], "codex_local_access");
+            }
+
+            write_account_bundle_to_dir(&profile_dir, &oauth_account).expect("write oauth bundle");
+            let content = fs::read_to_string(profile_dir.join("config.toml")).expect("read config");
+            assert_builtin_provider_config(&content);
+            assert!(
+                !content.contains("experimental_bearer_token"),
+                "config: {content}"
+            );
+            assert!(!content.contains("deepseek"), "config: {content}");
+            assert!(
+                !content.contains("preferred_auth_method"),
+                "config: {content}"
+            );
+            assert!(!profile_dir
+                .join(super::CODEX_PROVIDER_OVERRIDE_FILE)
+                .exists());
+        }
+    }
+
+    #[test]
+    fn provider_snapshot_oauth_bundle_preserves_manual_provider_and_model_changes() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let env = TestEnvGuard::new("codex-provider-snapshot-manual-bundle");
+        let oauth_account = seed_oauth_account(make_codex_tokens(
+            "demo@example.com",
+            "acc-current",
+            "org-current",
+            "provider-manual-bundle",
+            "rt-provider-manual-bundle",
+        ));
+        let mut deepseek_account = CodexAccount::new_api_key(
+            "deepseek-manual-bundle-key".to_string(),
+            "deepseek-manual-bundle@example.com".to_string(),
+            "sk-deepseek-manual-bundle".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.deepseek.com".to_string()),
+            Some("deepseek".to_string()),
+            Some("DeepSeek".to_string()),
+            vec!["deepseek-v4-pro".to_string()],
+        );
+        deepseek_account.api_wire_api = Some("responses".to_string());
+        deepseek_account.api_sync_model_catalog_to_codex = true;
+        deepseek_account.api_startup_model = Some("deepseek-v4-pro".to_string());
+
+        for (access_mode, manual_provider) in [
+            ("direct", Some("myrelay")),
+            ("direct", None),
+            ("cdp", Some("myrelay")),
+            ("cdp", None),
+        ] {
+            deepseek_account.api_instance_access_mode = Some(access_mode.to_string());
+            let profile_dir = env.home_dir.join(format!(
+                "manual-profile-{access_mode}-{}",
+                manual_provider.unwrap_or("builtin")
+            ));
+            fs::create_dir_all(&profile_dir).expect("create profile");
+            let config_path = profile_dir.join("config.toml");
+            fs::write(&config_path, "model = \"gpt-5.5\"\n").expect("write initial config");
+            write_account_bundle_to_dir(&profile_dir, &deepseek_account)
+                .expect("write deepseek bundle");
+            assert!(profile_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE).is_file());
+
+            let content = fs::read_to_string(&config_path).expect("read deepseek config");
+            let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(&content)
+                .expect("parse deepseek config");
+            doc["model"] = toml_edit::value("gpt-6-sol");
+            if let Some(provider) = manual_provider {
+                doc["model_provider"] = toml_edit::value(provider);
+                doc["model_providers"][provider] = toml_edit::table();
+                doc["model_providers"][provider]["name"] = toml_edit::value("My Relay");
+                doc["model_providers"][provider]["base_url"] =
+                    toml_edit::value("https://myrelay.example.com/v1");
+                doc["model_providers"][provider]["wire_api"] = toml_edit::value("responses");
+            } else {
+                doc.remove("model_provider");
+            }
+            fs::write(
+                &config_path,
+                crate::modules::codex_config_format::codex_config_doc_to_string(&mut doc),
+            )
+            .expect("write manual provider selection");
+
+            // Exercise auth projection and both catalog cleanup paths, then repeat the same
+            // projection to ensure a consumed snapshot cannot overwrite the user's selection.
+            for _ in 0..2 {
+                write_account_bundle_to_dir(&profile_dir, &oauth_account)
+                    .expect("write oauth bundle");
+                let content = fs::read_to_string(&config_path).expect("read oauth config");
+                let doc =
+                    crate::modules::codex_config_format::read_codex_config_doc_from_str(&content)
+                        .expect("parse oauth config");
+                let expected_provider = manual_provider.or_else(|| {
+                    if cfg!(target_os = "windows") {
+                        Some("openai")
+                    } else {
+                        None
+                    }
+                });
+                assert_eq!(
+                    doc.get("model_provider").and_then(|item| item.as_str()),
+                    expected_provider,
+                );
+                assert_eq!(doc["model"].as_str(), Some("gpt-6-sol"));
+                if let Some(provider) = manual_provider {
+                    assert_eq!(
+                        doc["model_providers"][provider]["base_url"].as_str(),
+                        Some("https://myrelay.example.com/v1"),
+                    );
+                }
+                assert!(!profile_dir.join(super::CODEX_PROVIDER_OVERRIDE_FILE).exists());
+            }
+        }
     }
 
     #[test]

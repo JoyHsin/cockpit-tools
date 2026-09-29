@@ -922,6 +922,7 @@ fn build_account_pool_health_snapshot(
 
 #[derive(Debug, Clone, Copy, Default)]
 struct RequestStatsMeta<'a> {
+    proxy_route: Option<&'a CodexLocalAccessProxyRoute>,
     request_id: Option<&'a str>,
     client_instance_id: Option<&'a str>,
     http_status: Option<u16>,
@@ -1050,6 +1051,7 @@ async fn record_request_stats_with_meta(
             pricing.as_ref(),
             model_pricing_version,
             estimated_cost_usd,
+            meta.proxy_route,
         );
 
         apply_usage_event_to_current_windows(&mut runtime.stats, &event, now);
@@ -1140,6 +1142,15 @@ fn build_state_snapshot_inner(
         .collect();
     let account_health = build_account_health_snapshot(runtime);
     let account_pool_health = build_account_pool_health_snapshot(runtime);
+    let recovery_suppressed_account_ids = {
+        let now = now_ms();
+        runtime
+            .recovery_suppressed_accounts
+            .iter()
+            .filter(|(_, suppressed_until_ms)| **suppressed_until_ms > now)
+            .map(|(account_id, _)| account_id.clone())
+            .collect::<Vec<_>>()
+    };
     let quota_reserve_status = collection.as_ref().and_then(build_quota_reserve_status);
     let service_enabled = collection
         .as_ref()
@@ -1166,6 +1177,7 @@ fn build_state_snapshot_inner(
         stats,
         account_health,
         account_pool_health,
+        recovery_suppressed_account_ids,
         quota_reserve_status,
     }
 }

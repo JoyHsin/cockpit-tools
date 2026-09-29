@@ -15,6 +15,7 @@ import (
 	"time"
 
 	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 
 	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkopenai "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
@@ -148,6 +149,7 @@ func main() {
 		}
 	}
 	emitter.emitStartupStage("init_runtime")
+	helps.SetRequestProxyRouteObserver(newRequestProxyRouteObserver(m.ProxyRouteObservers))
 	m.quotaCooldowns = newQuotaCooldownStateStore(*quotaPoolStatePath, m)
 	if err := m.quotaCooldowns.load(); err != nil {
 		emitter.emit(map[string]any{"type": "quota_cooldown_state_error", "message": err.Error()})

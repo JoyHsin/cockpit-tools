@@ -1300,6 +1300,7 @@ fn upsert_account_from_access_token_with_hints(
         acc.tokens = tokens;
         mark_token_chain_updated(&mut acc);
         acc.auth_mode = CodexAuthMode::OAuth;
+        acc.upstream_grok_account_id = None;
         acc.authorization_status = None;
         acc.openai_api_key = None;
         acc.api_base_url = None;
@@ -1326,6 +1327,7 @@ fn upsert_account_from_access_token_with_hints(
         let mut acc = CodexAccount::new(existing_id.clone(), email.clone(), tokens);
         mark_token_chain_updated(&mut acc);
         acc.auth_mode = CodexAuthMode::OAuth;
+        acc.upstream_grok_account_id = None;
         acc.authorization_status = None;
         acc.openai_api_key = None;
         acc.api_base_url = None;
@@ -1862,7 +1864,11 @@ pub fn export_accounts(account_ids: &[String]) -> Result<String, String> {
         .filter_map(|id| load_account(id))
         .collect();
 
-    serde_json::to_string_pretty(&accounts).map_err(|e| format!("序列化失败: {}", e))
+    serialize_accounts_for_export(&accounts)
+}
+
+fn serialize_accounts_for_export(accounts: &[CodexAccount]) -> Result<String, String> {
+    serde_json::to_string_pretty(accounts).map_err(|e| format!("序列化失败: {}", e))
 }
 
 #[derive(serde::Serialize, Clone)]

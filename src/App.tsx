@@ -49,6 +49,7 @@ import { useWorkbuddyAccountStore } from './stores/useWorkbuddyAccountStore';
 import { useZedAccountStore } from './stores/useZedAccountStore';
 import { useSideNavLayoutStore } from './stores/useSideNavLayoutStore';
 import { usePlatformLayoutStore } from './stores/usePlatformLayoutStore';
+import { initializeClassicSidebar } from './utils/classicSidebarStartup';
 import { useTopRightAdStore } from './stores/useTopRightAdStore';
 import { useSponsorStore } from './stores/useSponsorStore';
 import { useRemoteConfigStore } from './stores/useRemoteConfigStore';
@@ -1299,8 +1300,13 @@ function MainApp() {
     if (sideNavLayoutMode !== 'classic' || sideNavClassicFirstSyncDone) {
       return;
     }
-    syncSidebarEntriesFromDashboard();
-    markSideNavClassicFirstSyncDone();
+    let current = true;
+    void initializeClassicSidebar({
+      isCurrent: () => current,
+      initialize: syncSidebarEntriesFromDashboard,
+      markInitialized: markSideNavClassicFirstSyncDone,
+    });
+    return () => { current = false; };
   }, [
     sideNavLayoutMode,
     sideNavClassicFirstSyncDone,

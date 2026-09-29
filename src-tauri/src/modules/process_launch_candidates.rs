@@ -653,9 +653,9 @@ fn score_windows_candidate(
         return Some(score);
     }
 
-    // The legacy Codex and current ChatGPT clients share this scanner. Do not
-    // accept helper executables whose paths merely contain one of those names.
-    if exe_names_lower.contains("chatgpt.exe") && exe_names_lower.contains("codex.exe") {
+    // The ChatGPT scanner must not accept helper executables whose paths merely
+    // contain "chatgpt" or the old "codex" GUI name.
+    if exe_names_lower.contains("chatgpt.exe") {
         return None;
     }
 
@@ -789,17 +789,12 @@ fn windows_app_launch_signature(app: &str) -> Option<WindowsAppLaunchSignature> 
             supports_multi_instance: true,
         }),
         "codex" => Some(WindowsAppLaunchSignature {
-            label: "ChatGPT / Codex",
-            exe_names: &["ChatGPT.exe", "Codex.exe"],
+            label: "ChatGPT",
+            exe_names: &["ChatGPT.exe"],
             command_names: &["chatgpt", "codex"],
             protocol_names: &["chatgpt", "codex"],
-            display_keywords: &["chatgpt", "codex", "openai chatgpt", "openai codex"],
-            common_paths: &[
-                "ChatGPT\\ChatGPT.exe",
-                "OpenAI ChatGPT\\ChatGPT.exe",
-                "Codex\\Codex.exe",
-                "OpenAI Codex\\Codex.exe",
-            ],
+            display_keywords: &["chatgpt", "openai chatgpt"],
+            common_paths: &["ChatGPT\\ChatGPT.exe", "OpenAI ChatGPT\\ChatGPT.exe"],
             supports_multi_instance: true,
         }),
         "claude" => Some(WindowsAppLaunchSignature {
@@ -1713,7 +1708,7 @@ fn log_managed_proxy_injection(mode: &str, cmd: &Command, pairs: &[(&'static str
         if proxy_url.is_empty() {
             "<none>"
         } else {
-            proxy_url
+            "<configured; credentials redacted>"
         },
         if no_proxy.is_empty() {
             "<empty>"
@@ -1735,6 +1730,136 @@ pub fn apply_managed_proxy_env_to_command(cmd: &mut Command) {
     }
 }
 
+fn account_proxy_env_pairs(proxy_url: &str) -> Vec<(&'static str, String)> {
+    let proxy_url = proxy_url.trim();
+    if proxy_url.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pairs = vec![
+        ("http_proxy", proxy_url.to_string()),
+        ("https_proxy", proxy_url.to_string()),
+        ("HTTP_PROXY", proxy_url.to_string()),
+        ("HTTPS_PROXY", proxy_url.to_string()),
+        ("all_proxy", proxy_url.to_string()),
+        ("ALL_PROXY", proxy_url.to_string()),
+    ];
+    let no_proxy = crate::modules::codex_protocol::merge_local_no_proxy("");
+    if !no_proxy.is_empty() {
+        pairs.push(("no_proxy", no_proxy.clone()));
+        pairs.push(("NO_PROXY", no_proxy));
+    }
+    pairs
+}
+
+pub fn apply_effective_proxy_env_to_command(cmd: &mut Command, egress_proxy_url: Option<&str>) {
+    let Some(proxy_url) = egress_proxy_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        apply_managed_proxy_env_to_command(cmd);
+        return;
+    };
+
+    let pairs = account_proxy_env_pairs(proxy_url);
+    log_managed_proxy_injection("account-env", cmd, &pairs);
+    for (key, value) in pairs {
+        cmd.env(key, value);
+    }
+}
+
+#[cfg(test)]
+mod account_egress_proxy_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_env_preserves_local_gateway_bypass() {
+        assert!(account_proxy_env_pairs("  ").is_empty());
+        let pairs = account_proxy_env_pairs(" socks5://127.0.0.1:1080 ");
+        for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+            assert!(pairs.iter().any(|(name, value)| *name == key && value == "socks5://127.0.0.1:1080"));
+        }
+        for key in ["no_proxy", "NO_PROXY"] {
+            let value = &pairs.iter().find(|(name, _)| *name == key).unwrap().1;
+            assert!(value.contains("localhost"));
+            assert!(value.contains("127.0.0.1"));
+        }
+    }
+
+    #[test]
+    fn global_proxy_launch_args_respect_enabled_state_and_protocol() {
+        for (enabled, proxy) in [(false, "http://127.0.0.1:7897"), (true, "  "), (true, "http://user:secret@127.0.0.1:7897")] {
+            let mut args = vec!["--other".to_string()];
+            append_global_electron_proxy_args_from_config(&mut args, enabled, proxy);
+            assert_eq!(args, vec!["--other"]);
+        }
+        for (proxy, expected) in [("http://127.0.0.1:7897", "http://127.0.0.1:7897"), ("socks5h://127.0.0.1:7897", "socks5://127.0.0.1:7897")] {
+            let mut args = vec!["--other".to_string()];
+            append_global_electron_proxy_args_from_config(&mut args, true, proxy);
+            assert_eq!(args, vec!["--other".to_string(), format!("--proxy-server={expected}"), "--proxy-bypass-list=localhost;127.0.0.1;[::1]".to_string()]);
+        }
+    }
+
+    #[test]
+    fn bound_account_proxy_cannot_be_bypassed_by_extra_arguments() {
+        let mut args = ["--proxy-server=http://127.0.0.1:8080", "--proxy-bypass-list=*", "--no-proxy-server", "--proxy-pac-url", "http://pac.invalid", "--other"].map(str::to_string).to_vec();
+        append_electron_proxy_args(&mut args, "socks5://127.0.0.1:1080");
+        assert_eq!(args, vec!["--other", "--proxy-server=socks5://127.0.0.1:1080", "--proxy-bypass-list=localhost;127.0.0.1;[::1]"]);
+        let mut args = Vec::new();
+        append_electron_proxy_args(&mut args, "socks5h://127.0.0.1:1080");
+        assert_eq!(args[0], "--proxy-server=socks5://127.0.0.1:1080");
+        assert!(args[1].contains("127.0.0.1"));
+    }
+}
+
+pub fn append_global_electron_proxy_args(args: &mut Vec<String>) {
+    let config = config::get_user_config();
+    append_global_electron_proxy_args_from_config(
+        args, config.global_proxy_enabled, &config.global_proxy_url,
+    );
+}
+
+fn append_global_electron_proxy_args_from_config(args: &mut Vec<String>, enabled: bool, proxy_url: &str) {
+    if !enabled || proxy_url.trim().is_empty() {
+        return;
+    }
+    // Chromium does not support credentials in --proxy-server. Keep the existing
+    // environment-only behavior for those URLs instead of exposing credentials.
+    if let Ok(url) = url::Url::parse(proxy_url.trim()) {
+        if !url.username().is_empty() || url.password().is_some() {
+            return;
+        }
+    }
+    append_electron_proxy_args(args, proxy_url);
+}
+
+pub fn append_electron_proxy_args(args: &mut Vec<String>, proxy_url: &str) {
+    let proxy_url = proxy_url.trim();
+    if proxy_url.is_empty() {
+        return;
+    }
+    // An explicitly selected account or global proxy takes precedence over old
+    // launch flags; otherwise Chromium can bypass it.
+    let mut cleaned = Vec::with_capacity(args.len());
+    let mut iter = args.drain(..).peekable();
+    while let Some(arg) = iter.next() {
+        let name = arg.trim_start().split('=').next().unwrap_or("");
+        if ["--proxy-server", "--proxy-pac-url", "--proxy-bypass-list", "--no-proxy-server", "--proxy-auto-detect"].contains(&name) {
+            if !arg.contains('=') && ["--proxy-server", "--proxy-pac-url", "--proxy-bypass-list"].contains(&name)
+                && iter.peek().is_some_and(|next| !next.starts_with('-')) {
+                iter.next();
+            }
+            continue;
+        }
+        cleaned.push(arg);
+    }
+    drop(iter);
+    *args = cleaned;
+    let chromium_proxy_url = proxy_url.replace("socks5h://", "socks5://");
+    args.push(format!("--proxy-server={chromium_proxy_url}"));
+    args.push("--proxy-bypass-list=localhost;127.0.0.1;[::1]".to_string());
+}
+
 #[cfg(target_os = "macos")]
 pub fn append_managed_proxy_env_to_open_args(cmd: &mut Command) {
     let pairs = managed_proxy_env_pairs();
@@ -1747,8 +1872,28 @@ pub fn append_managed_proxy_env_to_open_args(cmd: &mut Command) {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn append_effective_proxy_env_to_open_args(cmd: &mut Command, egress_proxy_url: Option<&str>) {
+    let Some(proxy_url) = egress_proxy_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        append_managed_proxy_env_to_open_args(cmd);
+        return;
+    };
+
+    let pairs = account_proxy_env_pairs(proxy_url);
+    log_managed_proxy_injection("account-open-arg", cmd, &pairs);
+    for (key, value) in pairs {
+        cmd.arg("--env").arg(format!("{}={}", key, value));
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn append_managed_proxy_env_to_open_args(_cmd: &mut Command) {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn append_effective_proxy_env_to_open_args(_cmd: &mut Command, _egress_proxy_url: Option<&str>) {}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_detached_unix(cmd: &mut Command) -> Result<Child, String> {

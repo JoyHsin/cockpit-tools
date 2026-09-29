@@ -256,11 +256,18 @@ export interface CodexTokenBreakdown {
   unclassified_tokens: number;
 }
 
+export interface CodexLocalAccessProxyRoute {
+  kind: "node" | "proxy" | "direct" | "unknown";
+  name: string;
+}
+
 export interface CodexLocalAccessUsageEvent {
   timestamp: number;
   requestId: string;
   accountId: string;
   email: string;
+  /** 请求执行时记录的代理快照；旧日志不按当前账号绑定回填。 */
+  proxyRoute?: CodexLocalAccessProxyRoute | null;
   apiKeyId: string;
   apiKeyLabel: string;
   /** 多开实例目录 ID（x-cockpit-instance-id） */
@@ -425,6 +432,8 @@ export interface CodexLocalAccessState {
   stats: CodexLocalAccessStats;
   accountHealth: CodexLocalAccessAccountHealth[];
   accountPoolHealth: CodexLocalAccessAccountPoolHealth[];
+  /** 手动恢复后仍在抑制窗口内的账号：异常列表里临时隐藏这些账号的行。 */
+  recoverySuppressedAccountIds?: string[];
   quotaReserveStatus: CodexLocalAccessQuotaReserveStatus | null;
 }
 

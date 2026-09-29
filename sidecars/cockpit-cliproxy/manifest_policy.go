@@ -98,18 +98,19 @@ type accountModelRule struct {
 }
 
 type manifest struct {
-	Locale                     string              `json:"locale"`
-	APIKeys                    []apiKeySpec        `json:"apiKeys"`
-	Accounts                   []accountSpec       `json:"accounts"`
-	ModelIDs                   []string            `json:"modelIds"`
-	ImageGenerationModel       string              `json:"imageGenerationModel"`
-	ModelAliases               []modelAliasSpec    `json:"modelAliases"`
-	ExcludedModels             []string            `json:"excludedModels"`
-	AccountModelRules          []accountModelRule  `json:"accountModelRules"`
-	RoutingStrategy            string              `json:"routingStrategy"`
-	CustomRoutingRules         []customRoutingRule `json:"customRoutingRules"`
-	ImmediateSSEResponse       bool                `json:"immediateSseResponse"`
-	MaxConcurrentImageRequests int                 `json:"maxConcurrentImageRequests"`
+	ProxyRouteObservers        []proxyRouteObserverSpec `json:"proxyRouteObservers,omitempty"`
+	Locale                     string                   `json:"locale"`
+	APIKeys                    []apiKeySpec             `json:"apiKeys"`
+	Accounts                   []accountSpec            `json:"accounts"`
+	ModelIDs                   []string                 `json:"modelIds"`
+	ImageGenerationModel       string                   `json:"imageGenerationModel"`
+	ModelAliases               []modelAliasSpec         `json:"modelAliases"`
+	ExcludedModels             []string                 `json:"excludedModels"`
+	AccountModelRules          []accountModelRule       `json:"accountModelRules"`
+	RoutingStrategy            string                   `json:"routingStrategy"`
+	CustomRoutingRules         []customRoutingRule      `json:"customRoutingRules"`
+	ImmediateSSEResponse       bool                     `json:"immediateSseResponse"`
+	MaxConcurrentImageRequests int                      `json:"maxConcurrentImageRequests"`
 	// MaxAccountConcurrency 限制单个账号同时处理的会话数；0 表示不限制。
 	MaxAccountConcurrency int `json:"maxAccountConcurrency"`
 	// AccountConcurrencyWaitMs 账号并发达到上限后的等待时长（毫秒）；0 表示不等待，直接拒绝。
@@ -433,34 +434,35 @@ type customRoutingRule struct {
 }
 
 type usagePayload struct {
-	Type      string `json:"type"`
-	RequestID string `json:"requestId,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Alias     string `json:"alias,omitempty"`
+	ProxyRoute *coreusage.ProxyRoute `json:"proxyRoute,omitempty"`
+	Type       string                `json:"type"`
+	RequestID  string                `json:"requestId,omitempty"`
+	Provider   string                `json:"provider,omitempty"`
+	Model      string                `json:"model,omitempty"`
+	Alias      string                `json:"alias,omitempty"`
 	// RequestedModel keeps the client-requested model (route namespace intact)
 	// while Model/UpstreamModel carry the model that actually reached upstream.
-	RequestedModel   string       `json:"requestedModel,omitempty"`
-	UpstreamModel    string       `json:"upstreamModel,omitempty"`
-	AccountID        string       `json:"accountId,omitempty"`
-	AccountEmail     string       `json:"accountEmail,omitempty"`
-	AuthID           string       `json:"authId,omitempty"`
-	APIKeyID         string       `json:"apiKeyId,omitempty"`
-	APIKeyLabel      string       `json:"apiKeyLabel,omitempty"`
-	ClientInstanceID string       `json:"clientInstanceId,omitempty"`
-	RequestKind      string       `json:"requestKind,omitempty"`
-	ServiceTier      string       `json:"serviceTier,omitempty"`
-	ReasoningEffort  string       `json:"reasoningEffort,omitempty"`
-	Success          bool         `json:"success"`
-	Status           int          `json:"status,omitempty"`
-	ErrorCategory    string       `json:"errorCategory,omitempty"`
-	ErrorMessage     string       `json:"errorMessage,omitempty"`
-	LatencyMS        int64        `json:"latencyMs,omitempty"`
+	RequestedModel   string `json:"requestedModel,omitempty"`
+	UpstreamModel    string `json:"upstreamModel,omitempty"`
+	AccountID        string `json:"accountId,omitempty"`
+	AccountEmail     string `json:"accountEmail,omitempty"`
+	AuthID           string `json:"authId,omitempty"`
+	APIKeyID         string `json:"apiKeyId,omitempty"`
+	APIKeyLabel      string `json:"apiKeyLabel,omitempty"`
+	ClientInstanceID string `json:"clientInstanceId,omitempty"`
+	RequestKind      string `json:"requestKind,omitempty"`
+	ServiceTier      string `json:"serviceTier,omitempty"`
+	ReasoningEffort  string `json:"reasoningEffort,omitempty"`
+	Success          bool   `json:"success"`
+	Status           int    `json:"status,omitempty"`
+	ErrorCategory    string `json:"errorCategory,omitempty"`
+	ErrorMessage     string `json:"errorMessage,omitempty"`
+	LatencyMS        int64  `json:"latencyMs,omitempty"`
 	// TurnStateLength/TurnStateClass 来自上游响应头的旁路观测；state 原文不保存。
-	TurnStateLength *int   `json:"turnStateLength,omitempty"`
-	TurnStateClass  string `json:"turnStateClass,omitempty"`
-	Usage            usageDetails `json:"usage"`
-	RequestedAtMS    int64        `json:"requestedAtMs,omitempty"`
+	TurnStateLength *int         `json:"turnStateLength,omitempty"`
+	TurnStateClass  string       `json:"turnStateClass,omitempty"`
+	Usage           usageDetails `json:"usage"`
+	RequestedAtMS   int64        `json:"requestedAtMs,omitempty"`
 }
 
 type requestDiagnosticPayload struct {
@@ -893,14 +895,26 @@ func (t *requestUsageTracker) finalize(requestID string, input usageFinalizeInpu
 	if strings.TrimSpace(payload.RequestKind) == "" {
 		payload.RequestKind = strings.TrimSpace(input.requestKind)
 	}
-	if selectedOK {
+	// Successful usage keeps the route observed by the attempt that reported it.
+	// For a final HTTP failure, only the last recorded attempt can describe the
+	// final route. A different selection without usage leaves that route unknown.
+	if input.status >= http.StatusBadRequest && len(records) > 0 {
+		routeRecord := records[len(records)-1]
+		payload.ProxyRoute = routeRecord.ProxyRoute
+		if selectedOK && (strings.TrimSpace(routeRecord.AuthID) == "" ||
+			!strings.EqualFold(strings.TrimSpace(routeRecord.AuthID), strings.TrimSpace(selected.AuthID))) {
+			payload.ProxyRoute = nil
+		}
+	}
+	// Token usage belongs to the attempt that reported it, not the last account
+	// selected for this downstream request. Async callbacks and retries may differ.
+	canUseSelected := len(records) == 0 ||
+		(strings.TrimSpace(payload.AccountID) == "" && strings.TrimSpace(payload.AuthID) != "" &&
+			strings.EqualFold(strings.TrimSpace(payload.AuthID), strings.TrimSpace(selected.AuthID)))
+	if selectedOK && canUseSelected {
 		payload.AccountID = selected.AccountID
 		payload.AccountEmail = selected.AccountEmail
 		payload.AuthID = selected.AuthID
-	} else {
-		payload.AccountID = ""
-		payload.AccountEmail = ""
-		payload.AuthID = ""
 	}
 	if input.status > 0 {
 		payload.Status = input.status
@@ -1733,16 +1747,45 @@ func ollamaModelFamily(model string) string {
 func ollamaContextLength(model string) int {
 	switch {
 	case strings.HasPrefix(model, "gpt-6-astra"), strings.HasPrefix(model, "gpt-6-sol"), strings.HasPrefix(model, "gpt-6-luna"):
-		return 1050000
+		return 256000
+	// 以下家族值统一收敛到 Codex 客户端目录（codex_client_models.json）真值，
+	// 避免同一个模型在目录、Ollama 兼容层与 API 服务里报出不同的上下文。
 	case strings.HasPrefix(model, "gpt-5.6"):
-		return 372000
+		return 272000
 	case strings.HasPrefix(model, "gpt-5.5"), strings.HasPrefix(model, "gpt-5.4"):
-		return 400000
+		return 272000
 	case strings.HasPrefix(model, "gpt-5.3"), strings.HasPrefix(model, "gpt-5.2"), strings.HasPrefix(model, "gpt-5.1"):
 		return 272000
 	default:
 		return 131072
 	}
+}
+
+// autoCompactTokenLimitFor 返回目录里声明某个上下文窗口时必须一并下发的压缩阈值。
+//
+// Codex 客户端只认「上下文窗口 + 压缩阈值」这一对声明：只写窗口会让客户端回退到
+// 自身的压缩策略，写满 100% 则永远不会触发压缩。统一按 90% 派生，留出压缩所需的
+// 生成预算。
+func autoCompactTokenLimitFor(contextWindow int64) int64 {
+	if contextWindow <= 0 {
+		return 0
+	}
+	return contextWindow * 90 / 100
+}
+
+// ensureCodexClientCompactionLimit 保证目录条目「上下文窗口 + 压缩阈值」成对下发。
+//
+// 缺失或为 null 时按 90% 派生；已声明但不小于窗口（等于 100%，永远不会触发压缩）时
+// 同样收敛到 90%。其余情况保留目录真值，避免覆盖上游自己的压缩策略。
+func ensureCodexClientCompactionLimit(model map[string]any) {
+	window := intModelValueAny(model["context_window"])
+	if window <= 0 {
+		return
+	}
+	if limit := intModelValueAny(model["auto_compact_token_limit"]); limit > 0 && limit < window {
+		return
+	}
+	model["auto_compact_token_limit"] = autoCompactTokenLimitFor(int64(window))
 }
 
 func ollamaReasoningEfforts(model string) []string {
@@ -1837,6 +1880,8 @@ func applyExplicitContextWindows(models []map[string]any, windows map[string]int
 		if window := lookupExplicitContextWindow(windows, slug); window > 0 {
 			model["context_window"] = window
 			model["max_context_window"] = window
+			// 显式窗口同样必须带压缩阈值，否则客户端会退回内置压缩策略。
+			model["auto_compact_token_limit"] = autoCompactTokenLimitFor(window)
 		}
 	}
 }
@@ -1887,6 +1932,9 @@ func buildCodexClientModelsResponse(models []string, spec *apiKeySpec, windows m
 		// official context/service-tier values from codex_client_models.json.
 		if cw := ollamaContextLength(model); cw > 0 {
 			entry["context_length"] = cw
+			// 目录里声明窗口就必须同时声明压缩阈值，只写窗口会被客户端
+			// 当成「未声明压缩」并回退到自身默认策略。
+			entry["auto_compact_token_limit"] = autoCompactTokenLimitFor(int64(cw))
 		}
 		sourceModels = append(sourceModels, entry)
 	}
@@ -1917,6 +1965,7 @@ func buildCodexClientModelsResponse(models []string, spec *apiKeySpec, windows m
 					"supported_reasoning_levels", "default_reasoning_level",
 					"service_tiers", "additional_speed_tiers",
 					"context_window", "max_context_window",
+					"auto_compact_token_limit",
 				} {
 					if value, exists := template[field]; exists {
 						model[field] = value
@@ -1970,6 +2019,9 @@ func buildCodexClientModelsResponse(models []string, spec *apiKeySpec, windows m
 					model["max_context_window"] = cw
 				}
 			}
+			// 窗口与压缩阈值必须成对下发：模板、路由继承或缺口补齐得到的窗口
+			// 都要带压缩阈值，不允许留空，也不允许出现永不触发压缩的 100%。
+			ensureCodexClientCompactionLimit(model)
 			if _, ok := model["additional_speed_tiers"]; !ok {
 				model["additional_speed_tiers"] = []any{}
 			}

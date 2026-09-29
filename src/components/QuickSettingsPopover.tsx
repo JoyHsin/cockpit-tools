@@ -68,6 +68,7 @@ import {
   setAccountsOverviewFilterPersistenceEnabled,
 } from '../utils/accountsOverviewFilterPersistence';
 import { CodexSshSyncSettingsControl } from './codex/CodexSshSyncSettingsControl';
+import { CodexProxyDisplayControl } from './codex/CodexProxyDisplayControl';
 import { CodexContextManagementControl } from './codex/CodexContextManagementControl';
 import { getCodexExperimentalModelErrorMessage } from '../utils/codexExperimentalModel';
 import { CodexExperimentalModelEditor } from './codex/CodexExperimentalModelEditor';
@@ -1772,6 +1773,13 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
           </div>
         )}
 
+        {!config && !error && (
+          <div className="qs-loading" role="status" aria-live="polite">
+            <span className="loading-spinner" aria-hidden="true" />
+            <span>{t('common.loading', '加载中...')}</span>
+          </div>
+        )}
+
         {config && (
           <div className="qs-body">
             {type === 'grok' && (
@@ -2764,6 +2772,8 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
                     </select>
                   </div>
                 </div>
+
+                <CodexProxyDisplayControl />
 
                 <div
                   className="qs-field-group"

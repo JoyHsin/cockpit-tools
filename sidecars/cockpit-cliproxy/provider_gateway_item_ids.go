@@ -40,7 +40,8 @@ func providerGatewayItemIDPrefix(itemType string) string {
 // without ids at all), and the client persists whatever it receives. Once such a
 // conversation is replayed against an official account, the strict official
 // validator rejects the whole request with invalid_id_prefix. Rewriting the ids
-// here keeps the persisted history valid for every provider.
+// here repairs unsigned item identities. Existing reasoning IDs are opaque:
+// encrypted_content may bind to them, even if it only arrives in a later event.
 type providerGatewayItemIDRewriter struct {
 	mapped map[string]string
 	used   map[string]bool
@@ -136,6 +137,20 @@ func (r *providerGatewayItemIDRewriter) rewriteItemAtPath(payload []byte, path, 
 	if !item.IsObject() {
 		return payload
 	}
+	if item.Get("type").String() == "reasoning" {
+		id := item.Get("id").String()
+		if id != "" {
+			// Preserve the identity from the first event, before encrypted_content
+			// is available. Never trim, prefix, shorten or deduplicate this ID.
+			r.remember(id, id)
+			r.used[id] = true
+			return payload
+		}
+		if encrypted := item.Get("encrypted_content"); encrypted.Type == gjson.String && encrypted.String() != "" {
+			// A synthetic ID cannot restore the identity bound to this ciphertext.
+			return payload
+		}
+	}
 	prefix := providerGatewayItemIDPrefix(item.Get("type").String())
 	if prefix == "" {
 		return payload
@@ -143,10 +158,15 @@ func (r *providerGatewayItemIDRewriter) rewriteItemAtPath(payload []byte, path, 
 	originalID := strings.TrimSpace(item.Get("id").String())
 	callID := strings.TrimSpace(item.Get("call_id").String())
 	normalized := r.normalizeID(prefix, originalID, callID, fallback)
-	if normalized == "" || normalized == originalID {
+	if normalized == "" {
 		return payload
 	}
+	// Even an unchanged ID must be remembered: later events for this item
+	// must reuse it instead of treating its reserved ID as a collision.
 	r.remember(originalID, normalized)
+	if normalized == originalID {
+		return payload
+	}
 	updated, err := sjson.SetBytes(payload, path+".id", normalized)
 	if err != nil {
 		return payload

@@ -499,9 +499,26 @@ fn spawn_open_app_with_options_and_env(
     force_new_instance: bool,
     env_pairs: &[(&str, &str)],
 ) -> Result<u32, String> {
+    spawn_open_app_with_options_and_env_and_egress(
+        app_root,
+        args,
+        force_new_instance,
+        env_pairs,
+        None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_open_app_with_options_and_env_and_egress(
+    app_root: &str,
+    args: &[String],
+    force_new_instance: bool,
+    env_pairs: &[(&str, &str)],
+    egress_proxy_url: Option<&str>,
+) -> Result<u32, String> {
     let mut cmd = Command::new("open");
     sanitize_macos_gui_launch_env(&mut cmd);
-    append_managed_proxy_env_to_open_args(&mut cmd);
+    append_effective_proxy_env_to_open_args(&mut cmd, egress_proxy_url);
     for (key, value) in env_pairs {
         cmd.arg("--env").arg(format!("{}={}", key, value));
     }
@@ -741,86 +758,6 @@ fn find_codex_process_exe() -> Option<std::path::PathBuf> {
 fn is_codex_macos_main_process_command_line(lower_cmdline: &str) -> bool {
     lower_cmdline.contains("chatgpt.app/contents/macos/chatgpt")
         || lower_cmdline.contains("codex.app/contents/macos/codex")
-}
-
-#[cfg(any(test, target_os = "macos", target_os = "linux"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CodexProcessTreeEntry {
-    pid: u32,
-    parent_pid: u32,
-    command_line: String,
-}
-
-#[cfg(any(test, target_os = "macos", target_os = "linux"))]
-fn is_codex_direct_app_server_command_line(
-    command_line: &str,
-    expected_resource_executable: &str,
-) -> bool {
-    let command_line = command_line.trim();
-    let expected = expected_resource_executable.trim();
-    if command_line.is_empty() || expected.is_empty() {
-        return false;
-    }
-
-    let remainder = if let Some(remainder) = command_line.strip_prefix(expected) {
-        remainder
-    } else {
-        let quoted = format!("\"{}\"", expected);
-        let Some(remainder) = command_line.strip_prefix(&quoted) else {
-            return false;
-        };
-        remainder
-    };
-    let args = remainder.trim_start();
-    let Some(after_app_server) = args.strip_prefix("app-server") else {
-        return false;
-    };
-    if !after_app_server.is_empty() && !after_app_server.starts_with(char::is_whitespace) {
-        return false;
-    }
-    !after_app_server.trim_start().starts_with("daemon")
-}
-
-#[cfg(any(test, target_os = "macos", target_os = "linux"))]
-fn select_codex_direct_app_server_descendants(
-    entries: &[CodexProcessTreeEntry],
-    root_pids: &[u32],
-    expected_resource_executable: &str,
-) -> Vec<u32> {
-    let roots: HashSet<u32> = root_pids.iter().copied().filter(|pid| *pid != 0).collect();
-    if roots.is_empty() {
-        return Vec::new();
-    }
-    let parents: HashMap<u32, u32> = entries
-        .iter()
-        .map(|entry| (entry.pid, entry.parent_pid))
-        .collect();
-    let mut selected = Vec::new();
-
-    for entry in entries {
-        if !is_codex_direct_app_server_command_line(
-            &entry.command_line,
-            expected_resource_executable,
-        ) {
-            continue;
-        }
-        let mut current = entry.parent_pid;
-        let mut visited = HashSet::new();
-        while current != 0 && visited.insert(current) {
-            if roots.contains(&current) {
-                selected.push(entry.pid);
-                break;
-            }
-            let Some(parent) = parents.get(&current) else {
-                break;
-            };
-            current = *parent;
-        }
-    }
-
-    selected.sort();
-    selected.dedup();
-    selected
 }
 
 #[cfg(target_os = "macos")]
@@ -2393,6 +2330,7 @@ fn launch_codex_via_store_app_user_model_id(
     codex_home: Option<&str>,
     app_user_data_dir: Option<&str>,
     extra_args: &[String],
+    extra_env: &[(String, String)],
 ) -> Result<(), String> {
     let app_user_model_id = app_user_model_id.trim();
     if app_user_model_id.is_empty() {
@@ -2400,7 +2338,7 @@ fn launch_codex_via_store_app_user_model_id(
     }
 
     let escaped = escape_powershell_single_quoted(app_user_model_id);
-    let mut env_pairs = managed_proxy_env_pairs();
+    let mut env_pairs: Vec<(&str, String)> = managed_proxy_env_pairs();
     if let Some(codex_home) = codex_home.map(str::trim).filter(|value| !value.is_empty()) {
         env_pairs.push(("CODEX_HOME", codex_home.to_string()));
     }
@@ -2412,6 +2350,9 @@ fn launch_codex_via_store_app_user_model_id(
             "CODEX_ELECTRON_USER_DATA_PATH",
             app_user_data_dir.to_string(),
         ));
+    }
+    for (key, value) in extra_env {
+        env_pairs.push((key.as_str(), value.clone()));
     }
     let env_lines = env_pairs
         .into_iter()
@@ -3397,7 +3338,7 @@ fn resolve_trae_launch_path_for_platform(
     Err(app_path_missing_error(platform.provider_key()))
 }
 
-fn resolve_workbuddy_launch_path() -> Result<std::path::PathBuf, String> {
+pub(crate) fn resolve_workbuddy_launch_path() -> Result<std::path::PathBuf, String> {
     if let Some(custom) = normalize_custom_path(Some(&config::get_user_config().workbuddy_app_path))
     {
         if let Some(exec) = resolve_workbuddy_macos_exec_path(&custom) {

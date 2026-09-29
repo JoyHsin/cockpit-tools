@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 
 	"encoding/json"
@@ -384,7 +385,17 @@ func registerManifestCodexTokenAuths(
 }
 
 func readManifestCodexTokenAuth(account *accountSpec, authDir, path string) (*coreauth.Auth, error) {
-	data, err := os.ReadFile(path)
+	var (
+		data []byte
+		err  error
+	)
+	for attempt := 0; attempt < 5; attempt++ {
+		data, err = os.ReadFile(path)
+		if err == nil && len(bytes.TrimSpace(data)) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read manifest token auth file %s: %w", path, err)
 	}
@@ -581,10 +592,15 @@ func (r *sidecarRuntime) ExecuteStream(ctx context.Context, providers []string, 
 }
 
 func (r *sidecarRuntime) Stop() {
-	if r == nil || r.cancel == nil {
+	if r == nil {
 		return
 	}
-	r.cancel()
+	if r.cancel != nil {
+		r.cancel()
+	}
+	if r.service != nil {
+		_ = r.service.Shutdown(context.Background())
+	}
 	if r.done == nil {
 		return
 	}

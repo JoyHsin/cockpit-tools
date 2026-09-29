@@ -1559,16 +1559,16 @@ pub fn collect_codex_process_entries() -> Vec<(u32, Option<String>)> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn collect_codex_process_tree_entries() -> Vec<CodexProcessTreeEntry> {
-    let output = match Command::new("ps")
-        .args(["-axww", "-o", "pid=,ppid=,command="])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return Vec::new(),
-    };
+fn collect_codex_process_tree_entries() -> Result<Vec<CodexProcessTreeEntry>, String> {
+    let output = crate::modules::process_timeout::output_with_timeout(
+        Command::new("ps").args(["-axww", "-o", "pid=,ppid=,command="]),
+        Duration::from_secs(5),
+    ).map_err(|_| "CODEX_PROCESS_SCAN_FAILED")?;
+    if !output.status.success() {
+        return Err("CODEX_PROCESS_SCAN_FAILED".into());
+    }
 
-    String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let mut pid_parts = line.trim().splitn(2, |ch: char| ch.is_whitespace());
@@ -1586,18 +1586,18 @@ fn collect_codex_process_tree_entries() -> Vec<CodexProcessTreeEntry> {
                 command_line,
             })
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn collect_codex_direct_app_server_pids_for_roots(root_pids: &[u32]) -> Vec<u32> {
+fn collect_codex_direct_app_server_pids_for_roots(root_pids: &[u32]) -> Result<Vec<u32>, String> {
     #[cfg(target_os = "macos")]
     let Some(app_root) = resolve_codex_launch_path()
         .ok()
         .and_then(|path| resolve_macos_app_root_from_launch_path(&path))
         .or_else(|| resolve_macos_app_root_from_config("codex"))
     else {
-        return Vec::new();
+        return Err("CODEX_PROCESS_SCAN_FAILED".into());
     };
     #[cfg(target_os = "macos")]
     let expected_resource_executable = Path::new(&app_root)
@@ -1615,13 +1615,13 @@ fn collect_codex_direct_app_server_pids_for_roots(root_pids: &[u32]) -> Vec<u32>
             .filter(|candidate| candidate.is_file())
             .map(|candidate| candidate.to_string_lossy().to_string())
     }) else {
-        return Vec::new();
+        return Err("CODEX_PROCESS_SCAN_FAILED".into());
     };
-    select_codex_direct_app_server_descendants(
-        &collect_codex_process_tree_entries(),
+    Ok(select_codex_direct_app_server_descendants(
+        &collect_codex_process_tree_entries()?,
         root_pids,
         &expected_resource_executable,
-    )
+    ))
 }
 
 /// 查找指定 Codex profile 对应的官方 direct `app-server` 子进程。
@@ -1646,7 +1646,11 @@ pub fn collect_codex_app_server_pids_for_profile(profile_dir: &Path) -> Vec<u32>
             matches_profile.then_some(pid)
         })
         .collect::<Vec<_>>();
-    collect_codex_direct_app_server_pids_for_roots(&root_pids)
+    if root_pids.is_empty() { return Vec::new(); }
+    collect_codex_direct_app_server_pids_for_roots(&root_pids).unwrap_or_else(|error| {
+        crate::modules::logger::log_warn(&format!("[Codex Diagnostic] app-server scan failed: {error}"));
+        Vec::new()
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1682,7 +1686,7 @@ fn collect_codex_process_entries_from_powershell(
     let mut entries: Vec<(u32, Option<String>)> = Vec::new();
     let expected = escape_powershell_single_quoted(expected_exe_path);
     let script = format!(
-        r#"$processNames=@('ChatGPT.exe','Codex.exe');
+        r#"$processNames=@('ChatGPT.exe');
 $expectedRaw='{expected}';
 function Normalize-ExePath([string]$path) {{
   if ([string]::IsNullOrWhiteSpace($path)) {{ return $null }}
@@ -1799,6 +1803,9 @@ Get-CimInstance Win32_Process |
         };
         let parent_pid = parent_pid_str.parse::<u32>().ok();
         let lower = cmdline.to_lowercase();
+        if lower.trim().is_empty() {
+            continue;
+        }
         let dir = extract_user_data_dir_from_command_line(cmdline);
         if !lower.is_empty()
             && (is_helper_command_line(&lower) || lower.contains("crashpad_handler"))
@@ -1907,11 +1914,7 @@ fn collect_codex_process_entries_from_sysinfo_fallback(
             .and_then(|value| value.to_str())
             .unwrap_or("")
             .to_lowercase();
-        if name != "codex.exe"
-            && name != "chatgpt.exe"
-            && !exe_path.ends_with("\\codex.exe")
-            && !exe_path.ends_with("\\chatgpt.exe")
-        {
+        if name != "chatgpt.exe" && !exe_path.ends_with("\\chatgpt.exe") {
             continue;
         }
         let (resolved_exe, _) = resolve_windows_process_exe_for_match(process);
@@ -1926,6 +1929,9 @@ fn collect_codex_process_entries_from_sysinfo_fallback(
             .map(|arg| arg.to_string_lossy().to_lowercase())
             .collect::<Vec<String>>()
             .join(" ");
+        if args_line.trim().is_empty() {
+            continue;
+        }
         let dir = extract_user_data_dir(process.cmd());
         if !args_line.is_empty()
             && (is_helper_command_line(&args_line) || args_line.contains("crashpad_handler"))
@@ -1951,13 +1957,15 @@ fn collect_codex_process_entries_from_sysinfo_fallback(
 }
 
 #[cfg(target_os = "windows")]
-fn collect_codex_main_process_pids_from_sysinfo_fast(expected_exe_path: &str) -> Vec<u32> {
+fn collect_codex_main_process_entries_from_sysinfo_fast(
+    expected_exe_path: &str,
+) -> Vec<(u32, Option<String>)> {
     let expected = normalize_path_for_compare(expected_exe_path);
     if expected.is_empty() {
         return Vec::new();
     }
 
-    let mut pids = Vec::new();
+    let mut entries = Vec::new();
     let mut system = System::new();
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
@@ -1974,7 +1982,7 @@ fn collect_codex_main_process_pids_from_sysinfo_fast(expected_exe_path: &str) ->
         }
 
         let name = process.name().to_string_lossy().to_ascii_lowercase();
-        if name != "codex.exe" && name != "chatgpt.exe" {
+        if name != "chatgpt.exe" {
             continue;
         }
         let (resolved_exe, _) = resolve_windows_process_exe_for_match(process);
@@ -1989,6 +1997,9 @@ fn collect_codex_main_process_pids_from_sysinfo_fast(expected_exe_path: &str) ->
             .map(|arg| arg.to_string_lossy().to_ascii_lowercase())
             .collect::<Vec<String>>()
             .join(" ");
+        if args_line.trim().is_empty() {
+            continue;
+        }
         if !args_line.is_empty()
             && (is_helper_command_line(&args_line)
                 || args_line.contains("crashpad_handler")
@@ -1997,71 +2008,64 @@ fn collect_codex_main_process_pids_from_sysinfo_fast(expected_exe_path: &str) ->
             continue;
         }
 
-        pids.push(pid_u32);
+        entries.push((pid_u32, extract_user_data_dir(process.cmd())));
     }
-    pids.sort();
-    pids.dedup();
-    pids
+    entries.sort_by_key(|(pid, _)| *pid);
+    entries.dedup_by(|a, b| a.0 == b.0);
+    entries
 }
 
 #[cfg(target_os = "windows")]
-fn pick_started_codex_pid(pids: Vec<u32>, before_pids: &HashSet<u32>) -> Option<u32> {
-    let new_pids: Vec<u32> = pids
-        .iter()
-        .copied()
-        .filter(|pid| !before_pids.contains(pid))
-        .collect();
-    if let Some(pid) = pick_preferred_pid(new_pids) {
-        return Some(pid);
-    }
-    if before_pids.is_empty() {
-        return pick_preferred_pid(pids);
-    }
-    None
+fn codex_process_started_at_or_after(pid: u32, min_epoch_secs: u64) -> Option<bool> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    let process = system.process(Pid::from(pid as usize))?;
+    Some(process.start_time() >= min_epoch_secs)
 }
 
 #[cfg(target_os = "windows")]
-fn wait_for_codex_default_start_pid_fast(
-    expected_exe_path: &str,
-    before_pids: &HashSet<u32>,
-    timeout: Duration,
-) -> Option<u32> {
-    let started = Instant::now();
-    let mut last_full_probe_at: Option<Instant> = None;
-    while started.elapsed() < timeout {
-        let fast_pids = collect_codex_main_process_pids_from_sysinfo_fast(expected_exe_path);
-        if let Some(pid) = pick_started_codex_pid(fast_pids, before_pids) {
-            crate::modules::logger::log_info(&format!(
-                "[Codex Start] fast pid probe matched pid={}, elapsed_ms={}",
-                pid,
-                started.elapsed().as_millis()
-            ));
-            return Some(pid);
-        }
-
-        if started.elapsed() >= Duration::from_secs(2)
-            && last_full_probe_at
-                .map(|last| last.elapsed() >= Duration::from_secs(2))
-                .unwrap_or(true)
-        {
-            last_full_probe_at = Some(Instant::now());
-            let full_pids = collect_codex_process_entries()
-                .into_iter()
-                .map(|(pid, _)| pid)
-                .collect::<Vec<u32>>();
-            if let Some(pid) = pick_started_codex_pid(full_pids, before_pids) {
-                crate::modules::logger::log_info(&format!(
-                    "[Codex Start] fallback full pid probe matched pid={}, elapsed_ms={}",
-                    pid,
-                    started.elapsed().as_millis()
-                ));
-                return Some(pid);
+fn merge_codex_process_entries(
+    primary: Vec<(u32, Option<String>)>,
+    fallback: Vec<(u32, Option<String>)>,
+) -> Vec<(u32, Option<String>)> {
+    let mut by_pid: HashMap<u32, Option<String>> = HashMap::new();
+    for (pid, dir) in primary.into_iter().chain(fallback) {
+        match by_pid.get_mut(&pid) {
+            Some(existing) => {
+                if existing.is_none() && dir.is_some() {
+                    *existing = dir;
+                }
+            }
+            None => {
+                by_pid.insert(pid, dir);
             }
         }
-
-        thread::sleep(Duration::from_millis(120));
     }
-    None
+    let mut entries = by_pid.into_iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(pid, _)| *pid);
+    entries
+}
+
+#[cfg(target_os = "windows")]
+fn collect_codex_process_entries_complete() -> Vec<(u32, Option<String>)> {
+    let launch_path = match resolve_codex_launch_path() {
+        Ok(path) => path,
+        Err(err) => {
+            crate::modules::logger::log_warn(&format!(
+                "[Codex Probe] 启动路径未配置或无效，跳过完整 PID 匹配: {}",
+                err
+            ));
+            return Vec::new();
+        }
+    };
+    let expected = launch_path.to_string_lossy().to_string();
+    let powershell_entries = collect_codex_process_entries_from_powershell(&expected);
+    let sysinfo_entries = collect_codex_process_entries_from_sysinfo_fallback(&expected);
+    merge_codex_process_entries(powershell_entries, sysinfo_entries)
 }
 
 #[cfg(target_os = "windows")]
@@ -2180,6 +2184,16 @@ pub fn start_codex_with_args_and_env(
     extra_args: &[String],
     extra_env: &[(String, String)],
 ) -> Result<u32, String> {
+    start_codex_with_args_and_env_and_egress(codex_home, extra_args, extra_env, None)
+}
+
+/// 启动 Codex 桌面实例，并按账号覆盖全局出口代理。
+pub fn start_codex_with_args_and_env_and_egress(
+    codex_home: &str,
+    extra_args: &[String],
+    extra_env: &[(String, String)],
+    egress_proxy_url: Option<&str>,
+) -> Result<u32, String> {
     #[cfg(target_os = "macos")]
     {
         let app_root = resolve_codex_launch_path()
@@ -2224,11 +2238,12 @@ pub fn start_codex_with_args_and_env(
                     .iter()
                     .map(|(key, value)| (key.as_str(), value.as_str()))
                     .collect();
-                let open_pid = spawn_open_app_with_options_and_env(
+                let open_pid = spawn_open_app_with_options_and_env_and_egress(
                     &app_root,
                     &launch_args,
                     true,
                     &env_refs,
+                    egress_proxy_url,
                 )
                 .map_err(|e| format!("启动 Codex 失败: {}", e))?;
                 crate::modules::logger::log_info(&format!(
@@ -2255,7 +2270,13 @@ pub fn start_codex_with_args_and_env(
             return Err(app_path_missing_error("codex"));
         }
 
-        let open_pid = spawn_open_app_with_options(&app_root, &args, true)
+        let open_pid = spawn_open_app_with_options_and_env_and_egress(
+            &app_root,
+            &args,
+            true,
+            &[],
+            egress_proxy_url,
+        )
             .map_err(|e| format!("启动 Codex 失败: {}", e))?;
         crate::modules::logger::log_info("Codex 启动命令已发送（open -n -a）");
         // 轮询获取真实 PID
@@ -2292,6 +2313,14 @@ pub fn start_codex_with_args_and_env(
                 e
             )
         })?;
+        let mut effective_extra_env: Vec<(String, String)> = extra_env.to_vec();
+        if let Some(proxy_url) = egress_proxy_url {
+            effective_extra_env.extend(
+                account_proxy_env_pairs(proxy_url)
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value)),
+            );
+        }
 
         // 启动路径可能在自动修复后与初始配置不同（商店包更新会换目录），
         // 后续日志、PowerShell 兜底与诊断信息都使用实际尝试的路径。
@@ -2300,7 +2329,7 @@ pub fn start_codex_with_args_and_env(
             codex_home_trimmed,
             &app_user_data_dir,
             extra_args,
-            extra_env,
+            &effective_extra_env,
         );
 
         // 受管实例是通过「包身份」拉起的时为 true：此时没有可用的 spawn 句柄，
@@ -2325,7 +2354,7 @@ pub fn start_codex_with_args_and_env(
                         codex_home_trimmed,
                         &app_user_data_dir,
                         &fallback_args,
-                        extra_env,
+                        &effective_extra_env,
                     );
                     match powershell_result {
                         Ok(()) => {
@@ -2344,7 +2373,7 @@ pub fn start_codex_with_args_and_env(
                                 codex_home_trimmed,
                                 &app_user_data_dir,
                                 &fallback_args,
-                                extra_env,
+                                &effective_extra_env,
                             ) {
                                 Ok(()) => {
                                     launched_via_package_identity = true;
@@ -2450,7 +2479,7 @@ pub fn start_codex_with_args_and_env(
         })?;
 
         let mut command = Command::new(&launch_path);
-        apply_managed_proxy_env_to_command(&mut command);
+        apply_effective_proxy_env_to_command(&mut command, egress_proxy_url);
         sanitize_linux_gui_launch_env(&mut command);
         command
             .env("CODEX_HOME", codex_home_trimmed)
@@ -2498,7 +2527,7 @@ pub fn start_codex_with_args_and_env(
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
-        let _ = (codex_home, extra_args, extra_env);
+        let _ = (codex_home, extra_args, extra_env, egress_proxy_url);
         Err("当前系统不支持 Codex 应用多开".to_string())
     }
 }

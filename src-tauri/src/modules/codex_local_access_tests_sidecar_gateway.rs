@@ -229,6 +229,32 @@
     }
 
     #[test]
+    fn manual_recovery_suppresses_recovered_accounts_until_window_expires() {
+        let mut runtime = super::GatewayRuntime::default();
+        super::suppress_local_access_recovery_rows(
+            &mut runtime,
+            &["account-1".to_string(), " account-2 ".to_string()],
+            2_000,
+        );
+
+        assert_eq!(
+            runtime.recovery_suppressed_accounts.get("account-1"),
+            Some(&2_000)
+        );
+        assert_eq!(
+            runtime.recovery_suppressed_accounts.get("account-2"),
+            Some(&2_000)
+        );
+        assert_eq!(runtime.recovery_suppressed_accounts.len(), 2);
+
+        super::prune_runtime_routing_state(&mut runtime, 1_000);
+        assert_eq!(runtime.recovery_suppressed_accounts.len(), 2);
+
+        super::prune_runtime_routing_state(&mut runtime, 2_000);
+        assert!(runtime.recovery_suppressed_accounts.is_empty());
+    }
+
+    #[test]
     fn quota_exhaustion_blocks_dispatch_until_reset_or_recovery() {
         let mut runtime = super::GatewayRuntime::default();
         runtime.account_quota_cooldowns.insert(
@@ -284,6 +310,32 @@
         assert!(!runtime.account_health.contains_key("account-1"));
         assert!(!runtime.account_quota_cooldowns.contains_key("account-1"));
         assert!(runtime.account_quota_cooldowns.contains_key("account-2"));
+    }
+
+    #[test]
+    fn recovery_membership_removes_then_restores_selected_accounts() {
+        let current = vec![
+            "account-keep".to_string(),
+            "account-recover".to_string(),
+            "account-other".to_string(),
+        ];
+        let (selected, remaining, restored) = super::local_access_recovery_membership(
+            &current,
+            &[" account-recover ".to_string(), "missing".to_string()],
+        )
+        .expect("selected membership");
+
+        assert_eq!(selected, vec!["account-recover".to_string()]);
+        assert_eq!(
+            remaining,
+            vec!["account-keep".to_string(), "account-other".to_string()]
+        );
+        assert_eq!(restored, current);
+        assert!(super::local_access_recovery_membership(
+            &current,
+            &["missing".to_string()]
+        )
+        .is_err());
     }
 
     fn oauth_account_with_quota(
@@ -388,6 +440,18 @@
         assert_eq!(window("gpt-5.4"), Some(272000));
         assert_eq!(window("gpt-5.6-sol"), Some(900_000));
         assert_eq!(window("gpt-5.5"), Some(1048576));
+        // 统一口径：显式写窗口时必须同时写 90% 的压缩阈值。
+        let compact = |slug: &str| {
+            parsed["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == slug)
+                .and_then(|model| model["auto_compact_token_limit"].as_i64())
+        };
+        assert_eq!(compact("gpt-5.6-sol"), Some(810_000));
+        // 官方 DeepSeek 壳位模型保留目录原值，不会被兜底窗口覆盖。
+        assert_eq!(compact("gpt-5.5"), None);
     }
 
     #[test]
@@ -415,6 +479,16 @@
         };
         assert_eq!(window("gpt-5.4"), official_window);
         assert_eq!(window("gpt-5.6-sol"), Some(900_000));
+        // 统一口径：显式覆盖窗口时同步写入 90% 压缩阈值。
+        let compact = |slug: &str| {
+            decorated["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == slug)
+                .and_then(|model| model["auto_compact_token_limit"].as_i64())
+        };
+        assert_eq!(compact("gpt-5.6-sol"), Some(810_000));
     }
 
     #[test]
@@ -645,7 +719,7 @@
         cleanup_provider_gateway_profile_model_overrides, codex_price,
         collect_local_access_profile_takeover_dirs_from_store, compare_routing_candidates,
         count_request_logs_for_model_ids, default_codex_model_ids, effective_api_key_account_ids,
-        empty_stats_snapshot, ensure_local_compaction_for_account_pool, extract_usage_capture,
+        empty_stats_snapshot, extract_usage_capture,
         filter_bound_oauth_quota_reserve_account,
         filter_websocket_client_message, insert_local_access_usage_event,
         load_stats_windows_and_recent_events_from_conn,
@@ -675,7 +749,7 @@
         provider_gateway_image_generation_mode_for_account, provider_gateway_model_slots,
         provider_gateway_models_for_account, provider_model_slots_need_upstream_rewrite,
         read_http_request, read_request_log_reprice_batch, recompute_time_windows,
-        reapply_deepseek_profile_compaction_fallback, recover_invalid_stats_file,
+        reapply_deepseek_profile_config_overrides, recover_invalid_stats_file,
         remove_account_refs_from_collection,
         remove_codex_local_access_config, reprice_request_logs_for_collection,
         request_image_generation_mode, request_logs_has_column, request_ordered_account_ids,
@@ -692,6 +766,7 @@
         sidecar_auth_account_is_scoped, sidecar_auth_file_name, sidecar_auth_json_for_account,
         sidecar_auths_dir, sidecar_client_api_keys, sidecar_codex_api_key_auth_id,
         sidecar_codex_key_config_value, sidecar_config_fingerprint,
+        sidecar_config_fingerprint_with_account_proxies, account_proxy_fingerprint,
         sidecar_local_account_usable_for_start, sidecar_payload_default_service_tier,
         sidecar_quota_reserve_snapshot_value, sidecar_routing_strategy_value, sidecar_stable_id,
         sidecar_usage_event_is_client_canceled, sidecar_usage_event_should_auto_restart,
@@ -1655,8 +1730,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         assert!(!account_requires_provider_gateway(&account));
     }
 
-    #[test]
-    fn account_pool_with_deepseek_switches_profile_to_local_compaction() {
+    #[tokio::test]
+    async fn account_pool_compaction_cleanup_does_not_enable_removed_feature() {
         let deepseek_gateway = CodexLocalAccessProviderGateway {
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key: "sk-deepseek".to_string(),
@@ -1690,10 +1765,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         let mut collection = new_empty_local_access_collection().expect("collection");
         collection.enabled = true;
         collection.api_keys = vec![key.clone()];
-        assert!(super::collection_pool_contains_official_deepseek_account(&collection));
 
-        // 账号池没有能承接官方 GPT 模型的账号（这里是第三方 Chat 协议供应商）时，
-        // 压缩同样回到本地流程：这类上游没有可用的服务端压缩，远端压缩还会带着旧模型 ID 发出。
+        // 非 GPT 账号池与 DeepSeek 账号池都不再写已移除的压缩开关。
         key.provider_gateway = Some(CodexLocalAccessProviderGateway {
             base_url: "https://token-plan-cn.xiaomimimo.com/v1".to_string(),
             ..deepseek_gateway.clone()
@@ -1701,7 +1774,6 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         let mut other_collection = new_empty_local_access_collection().expect("collection");
         other_collection.enabled = true;
         other_collection.api_keys = vec![key.clone()];
-        assert!(!super::collection_pool_contains_official_deepseek_account(&other_collection));
 
         let profile_dir = make_temp_dir("codex-pool-local-compaction");
         let config_path = profile_config_path(&profile_dir);
@@ -1712,32 +1784,32 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         )
         .expect("write profile config");
 
-        ensure_local_compaction_for_account_pool(&profile_dir, &other_collection)
-            .expect("apply local compaction for non-gpt pool");
+        super::write_local_access_profile_takeover(&profile_dir, &other_collection, None, true)
+            .await.expect("take over non-gpt pool profile");
         let non_gpt_applied = fs::read_to_string(&config_path).expect("read profile config");
         assert!(
-            non_gpt_applied.contains("remote_compaction_v2 = false"),
-            "非 GPT 账号池必须回到本地压缩: {non_gpt_applied}"
+            !non_gpt_applied.contains("remote_compaction_v2"),
+            "非 GPT 账号池不得新增失效开关: {non_gpt_applied}"
         );
         assert!(
             non_gpt_applied.contains("service_tier = \"priority\""),
-            "压缩兜底只动压缩键，其它配置保持不变: {non_gpt_applied}"
+            "旧开关清理保留其它配置: {non_gpt_applied}"
         );
 
-        ensure_local_compaction_for_account_pool(&profile_dir, &collection)
-            .expect("apply deepseek pool fallback");
+        super::write_local_access_profile_takeover(&profile_dir, &collection, None, true)
+            .await.expect("take over deepseek pool profile");
         let applied = fs::read_to_string(&config_path).expect("read profile config");
-        assert!(applied.contains("remote_compaction_v2 = false"));
+        assert!(!applied.contains("remote_compaction_v2"));
         assert!(!applied.contains("token_budget"));
         assert!(applied.contains("js_repl = false"));
-        // 混合账号池只动压缩键，官方账号的 service_tier 必须保留。
+        // 官方账号的 service_tier 必须保留。
         assert!(applied.contains("service_tier = \"priority\""));
 
         fs::remove_dir_all(&profile_dir).expect("cleanup temp dir");
     }
 
     #[test]
-    fn deepseek_provider_gateway_profile_keeps_local_compaction_fallback() {
+    fn deepseek_provider_gateway_profile_keeps_valid_overrides() {
         let profile_dir = make_temp_dir("codex-deepseek-gateway-compaction");
         let config_path = profile_config_path(&profile_dir);
         crate::modules::codex_config_format::write_codex_config_toml_atomic(
@@ -1759,10 +1831,10 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         deepseek.api_wire_api = Some("responses".to_string());
         deepseek.api_sync_model_catalog_to_codex = true;
 
-        reapply_deepseek_profile_compaction_fallback(&profile_dir, &deepseek)
+        reapply_deepseek_profile_config_overrides(&profile_dir, &deepseek)
             .expect("reapply deepseek fallback");
         let applied = fs::read_to_string(&config_path).expect("read profile config");
-        assert!(applied.contains("remote_compaction_v2 = false"));
+        assert!(!applied.contains("remote_compaction_v2"));
         assert!(!applied.contains("token_budget"));
         assert!(applied.contains("js_repl = false"));
 
@@ -1785,7 +1857,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             Some("Moonshot".to_string()),
             vec!["kimi-k2".to_string()],
         );
-        reapply_deepseek_profile_compaction_fallback(&other_dir, &other)
+        reapply_deepseek_profile_config_overrides(&other_dir, &other)
             .expect("skip non-deepseek fallback");
         assert_eq!(
             fs::read_to_string(&other_config_path).expect("read other profile config"),
@@ -2715,6 +2787,86 @@ http_headers = { "x-cockpit-instance-id" = "default" }
     }
 
     #[test]
+    fn sidecar_fingerprint_tracks_account_local_proxy_port() {
+        let config = r#"{"host":"127.0.0.1","port":12345}"#;
+        let manifest = r#"{"accounts":[{"id":"account-a","email":"a@example.com"}]}"#;
+        let before = vec![account_proxy_fingerprint(Some(
+            "socks5h://local-user:local-secret@127.0.0.1:58887",
+        ))];
+        let after = vec![account_proxy_fingerprint(Some(
+            "socks5h://local-user:local-secret@127.0.0.1:64202",
+        ))];
+
+        assert_ne!(
+            sidecar_config_fingerprint_with_account_proxies(config, manifest, &before),
+            sidecar_config_fingerprint_with_account_proxies(config, manifest, &after),
+            "a restarted account tunnel must rebuild the sidecar instead of dialling the old port"
+        );
+        assert_eq!(
+            sidecar_config_fingerprint_with_account_proxies(config, manifest, &before),
+            sidecar_config_fingerprint_with_account_proxies(config, manifest, &before.clone()),
+            "an unchanged tunnel must not restart active streams"
+        );
+        assert_eq!(
+            sidecar_config_fingerprint(config, manifest),
+            sidecar_config_fingerprint_with_account_proxies(config, manifest, &[]),
+            "accounts without a local proxy keep the historical fingerprint"
+        );
+    }
+
+    #[test]
+    fn sidecar_fingerprint_ignores_account_proxy_order_but_not_absence() {
+        let config = r#"{"host":"127.0.0.1","port":12345}"#;
+        let manifest = r#"{"accounts":[{"id":"account-a"},{"id":"account-b"}]}"#;
+        let first = account_proxy_fingerprint(Some("http://127.0.0.1:1"));
+        let second = account_proxy_fingerprint(Some("http://127.0.0.1:2"));
+        let unordered = vec![first.clone(), second.clone()];
+        let reversed = vec![second.clone(), first.clone()];
+
+        assert_eq!(
+            sidecar_config_fingerprint_with_account_proxies(config, manifest, &unordered),
+            sidecar_config_fingerprint_with_account_proxies(config, manifest, &reversed),
+            "pool ordering must not churn the gateway"
+        );
+        assert_ne!(
+            sidecar_config_fingerprint_with_account_proxies(config, manifest, &unordered),
+            sidecar_config_fingerprint_with_account_proxies(
+                config,
+                manifest,
+                &[first.clone(), account_proxy_fingerprint(None)]
+            ),
+            "losing a bound proxy must rebuild the sidecar"
+        );
+        assert_ne!(
+            sidecar_config_fingerprint_with_account_proxies(
+                config,
+                manifest,
+                &[account_proxy_fingerprint(None)]
+            ),
+            sidecar_config_fingerprint_with_account_proxies(
+                config,
+                manifest,
+                &[account_proxy_fingerprint(Some("http://127.0.0.1:1"))]
+            ),
+            "binding a proxy must rebuild the sidecar"
+        );
+    }
+
+    #[test]
+    fn account_proxy_fingerprint_never_reveals_credentials() {
+        let digest = account_proxy_fingerprint(Some("socks5h://user:secret@127.0.0.1:58887"));
+        assert_eq!(digest.len(), 40);
+        for secret in ["user", "secret", "58887", "127.0.0.1"] {
+            assert!(
+                !digest.contains(secret),
+                "digest must not embed {secret}"
+            );
+        }
+        assert_eq!(account_proxy_fingerprint(Some("   ")), String::new());
+        assert_eq!(account_proxy_fingerprint(None), String::new());
+    }
+
+    #[test]
     fn sidecar_fingerprint_ignores_remaining_quota() {
         let config = r#"{"host":"127.0.0.1","port":58393}"#;
         let manifest_a = r#"{
@@ -3209,6 +3361,8 @@ http_headers = { "x-cockpit-instance-id" = "default" }
 
     #[test]
     fn scoped_api_key_pool_discovers_spark_entitlement_from_effective_accounts() {
+        let shared_state = crate::modules::codex_unified_proxy::TestCacheGuard::new();
+        shared_state.prepare_disabled();
         let mut plus = test_account_with_plan("plus");
         plus.id = "scoped-plus".to_string();
         plus.quota = Some(CodexQuota {
@@ -3626,6 +3780,8 @@ http_headers = { "x-cockpit-instance-id" = "default" }
 
     #[test]
     fn provider_gateway_runtime_auth_sync_rewrites_access_token_without_refresh_token() {
+        let shared_state = crate::modules::codex_unified_proxy::TestCacheGuard::new();
+        shared_state.prepare_disabled();
         let sidecar_dir = make_temp_dir("codex-provider-runtime-auth-sync");
         let auths_dir = sidecar_auths_dir(&sidecar_dir);
         fs::create_dir_all(&auths_dir).expect("create auths dir");
