@@ -6,7 +6,9 @@
  */
 
 import { invoke } from '@tauri-apps/api/core';
-import type { AccountGroup } from './accountGroupService';
+import { parseAccountGroups, type AccountGroup } from './accountGroupService';
+import * as antigravityGroups from './accountGroupService';
+import * as codexGroups from './codexAccountGroupService';
 
 export type { AccountGroup };
 
@@ -45,34 +47,15 @@ function generateId(): string {
   return `grp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function parseGroups(raw: string): AccountGroup[] {
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-      .map((item) => ({
-        id: typeof item.id === 'string' ? item.id : generateId(),
-        name: typeof item.name === 'string' ? item.name : '未命名分组',
-        accountIds: Array.isArray(item.accountIds)
-          ? (item.accountIds as unknown[]).filter((id): id is string => typeof id === 'string')
-          : [],
-        createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
-      }));
-  } catch {
-    return [];
-  }
-}
-
 // ─── 磁盘 I/O ───────────────────────────────────────────────
 
 async function loadFromDisk(platform: string): Promise<AccountGroup[]> {
   try {
     const raw: string = await invoke('load_platform_account_groups', { platform });
-    return parseGroups(raw);
+    return parseAccountGroups(raw);
   } catch (error) {
     console.error(`[PlatformGroups] Failed to load groups for ${platform}:`, error);
-    return [];
+    throw error;
   }
 }
 
@@ -105,15 +88,21 @@ async function saveGroupsInternal(platform: string, groups: AccountGroup[]): Pro
   cacheByPlatform.set(key, next);
 }
 
+// Existing platforms share their original cache, queue and platform-specific fields.
 // ─── 公开 API ────────────────────────────────────────────────
 
 export function getPlatformGroups(platform: string): Promise<AccountGroup[]> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.getAccountGroups();
+  if (key === 'codex') return codexGroups.getCodexAccountGroups();
   return enqueue(() => loadGroupsInternal(platform));
 }
 
 export function createPlatformGroup(platform: string, name: string): Promise<AccountGroup> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.createGroup(name);
+  if (key === 'codex') return codexGroups.createCodexGroup(name);
   return enqueue(async () => {
-    const key = normalizePlatform(platform);
     const groups = await loadGroupsInternal(key);
     const group: AccountGroup = {
       id: generateId(),
@@ -128,8 +117,10 @@ export function createPlatformGroup(platform: string, name: string): Promise<Acc
 }
 
 export function deletePlatformGroup(platform: string, groupId: string): Promise<void> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.deleteGroup(groupId);
+  if (key === 'codex') return codexGroups.deleteCodexGroup(groupId);
   return enqueue(async () => {
-    const key = normalizePlatform(platform);
     const groups = (await loadGroupsInternal(key)).filter((g) => g.id !== groupId);
     await saveGroupsInternal(key, groups);
   });
@@ -140,8 +131,10 @@ export function renamePlatformGroup(
   groupId: string,
   name: string
 ): Promise<AccountGroup | null> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.renameGroup(groupId, name);
+  if (key === 'codex') return codexGroups.renameCodexGroup(groupId, name);
   return enqueue(async () => {
-    const key = normalizePlatform(platform);
     const groups = await loadGroupsInternal(key);
     const group = groups.find((g) => g.id === groupId);
     if (!group) return null;
@@ -155,8 +148,10 @@ export function reorderPlatformGroups(
   platform: string,
   orderedGroupIds: string[]
 ): Promise<AccountGroup[]> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.reorderGroups(orderedGroupIds);
+  if (key === 'codex') return codexGroups.reorderCodexGroups(orderedGroupIds);
   return enqueue(async () => {
-    const key = normalizePlatform(platform);
     const groups = await loadGroupsInternal(key);
     const groupMap = new Map(groups.map((g) => [g.id, g]));
     const reordered: AccountGroup[] = [];
@@ -175,22 +170,37 @@ export function reorderPlatformGroups(
   });
 }
 
-export function assignAccountsToPlatformGroup(
+export function setPlatformGroupAccounts(
   platform: string,
   groupId: string,
   accountIds: string[]
 ): Promise<AccountGroup | null> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.setGroupAccounts(groupId, accountIds);
+  if (key === 'codex') return codexGroups.setCodexGroupAccounts(groupId, accountIds);
   return enqueue(async () => {
     const key = normalizePlatform(platform);
     const groups = await loadGroupsInternal(key);
     const group = groups.find((g) => g.id === groupId);
     if (!group) return null;
-    const targetIds = new Set(accountIds);
+    group.accountIds = Array.from(new Set(accountIds));
+    await saveGroupsInternal(key, groups);
+    return group;
+  });
+}
 
-    for (const currentGroup of groups) {
-      if (currentGroup.id === groupId) continue;
-      currentGroup.accountIds = currentGroup.accountIds.filter((id) => !targetIds.has(id));
-    }
+export function assignAccountsToPlatformGroup(
+  platform: string,
+  groupId: string,
+  accountIds: string[]
+): Promise<AccountGroup | null> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.addAccountsToGroup(groupId, accountIds);
+  if (key === 'codex') return codexGroups.assignAccountsToCodexGroup(groupId, accountIds);
+  return enqueue(async () => {
+    const groups = await loadGroupsInternal(key);
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) return null;
 
     const existing = new Set(group.accountIds);
     for (const id of accountIds) {
@@ -209,8 +219,10 @@ export function removeAccountsFromPlatformGroup(
   groupId: string,
   accountIds: string[]
 ): Promise<AccountGroup | null> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.removeAccountsFromGroup(groupId, accountIds);
+  if (key === 'codex') return codexGroups.removeAccountsFromCodexGroup(groupId, accountIds);
   return enqueue(async () => {
-    const key = normalizePlatform(platform);
     const groups = await loadGroupsInternal(key);
     const group = groups.find((g) => g.id === groupId);
     if (!group) return null;
@@ -225,8 +237,10 @@ export function removeAccountIdsFromAllPlatformGroups(
   platform: string,
   accountIds: string[]
 ): Promise<void> {
+  const key = normalizePlatform(platform);
+  if (key === 'antigravity') return antigravityGroups.removeAccountIdsFromAllGroups(accountIds);
+  if (key === 'codex') return codexGroups.removeAccountIdsFromAllCodexGroups(accountIds);
   return enqueue(async () => {
-    const key = normalizePlatform(platform);
     const toRemove = new Set(accountIds.map((id) => id.trim()).filter(Boolean));
     if (toRemove.size === 0) return;
     const groups = await loadGroupsInternal(key);
@@ -244,8 +258,13 @@ export function removeAccountIdsFromAllPlatformGroups(
 
 export function invalidatePlatformGroupCache(platform?: string): void {
   if (platform) {
-    cacheByPlatform.delete(normalizePlatform(platform));
+    const key = normalizePlatform(platform);
+    if (key === 'antigravity') antigravityGroups.invalidateCache();
+    if (key === 'codex') codexGroups.invalidateCodexGroupCache();
+    cacheByPlatform.delete(key);
   } else {
+    antigravityGroups.invalidateCache();
+    codexGroups.invalidateCodexGroupCache();
     cacheByPlatform.clear();
   }
 }

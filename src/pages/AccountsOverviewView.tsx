@@ -56,6 +56,7 @@ export function AccountsOverviewView(props: AccountsOverviewViewProps) {
     confirmClearSwitchHistory,
     confirmDelete,
     confirmDeleteTag,
+    copiedValidationUrlAccountId,
     copyAccountNoteValue,
     currentAccount,
     customSortAccounts,
@@ -89,6 +90,7 @@ export function AccountsOverviewView(props: AccountsOverviewViewProps) {
     handleBatchDelete,
     handleClearSwitchHistory,
     handleCopyOauthUrl,
+    handleCopyValidationUrl,
     handleCustomSortDragMove,
     handleCustomSortDragStart,
     handleExport,
@@ -148,6 +150,7 @@ export function AccountsOverviewView(props: AccountsOverviewViewProps) {
     requestDeleteTag,
     resetAddModalState,
     resetCustomSortOrder,
+    resolveValidationUrl,
     savedMfaRecords,
     savingAccountNote,
     savingPendingOAuthAccount,
@@ -1543,19 +1546,15 @@ export function AccountsOverviewView(props: AccountsOverviewViewProps) {
             ? t('wakeup.errorUi.tosViolationTitle', 'TOS 违规')
             : t('wakeup.errorUi.verificationRequiredTitle', '需要验证')
 
+          const validationUrl = resolveValidationUrl(account)
+          const lastMessage = vDetail?.lastMessage || account.quota_error?.message
+          const lastErrorCode = vDetail?.lastErrorCode || account.quota_error?.code
+
           const openLink = async (url: string) => {
             try {
               await openUrl(url)
             } catch {
               window.open(url, '_blank', 'noopener,noreferrer')
-            }
-          }
-
-          const copyLink = async (url: string) => {
-            try {
-              await navigator.clipboard.writeText(url)
-            } catch (e) {
-              console.error('复制失败', e)
             }
           }
 
@@ -1580,17 +1579,17 @@ export function AccountsOverviewView(props: AccountsOverviewViewProps) {
                   <div className="error-detail">
                     <div className="error-detail-meta">
                       <span>{t('modals.errors.account')}: {maskAccountText(account.email)}</span>
-                      {vDetail?.lastErrorCode && (
-                        <span>{t('wakeup.errorUi.errorCode', { code: vDetail.lastErrorCode })}</span>
+                      {lastErrorCode && (
+                        <span>{t('wakeup.errorUi.errorCode', { code: lastErrorCode })}</span>
                       )}
                     </div>
-                    {vDetail?.lastMessage && (
+                    {lastMessage && (
                       <div className="error-detail-message" style={{ marginTop: 12 }}>
-                        {vDetail.lastMessage}
+                        {lastMessage}
                       </div>
                     )}
                   </div>
-                  {!vDetail && (
+                  {!lastMessage && !validationUrl && (
                     <div className="empty-state-small" style={{ marginTop: 12 }}>
                       {t('modals.errors.empty', '暂无验证详情')}
                     </div>
@@ -1598,21 +1597,23 @@ export function AccountsOverviewView(props: AccountsOverviewViewProps) {
 
                   {/* Action buttons based on error type */}
                   <div className="modal-actions" style={{ marginTop: 20, gap: 8, flexWrap: 'wrap' }}>
-                    {!isTos && vDetail?.validationUrl && (
+                    {!isTos && validationUrl && (
                       <>
                         <button
-                          className="btn btn-primary"
-                          onClick={() => openLink(vDetail.validationUrl!)}
+                          className="btn btn-warning"
+                          onClick={() => openLink(validationUrl)}
                         >
                           <ExternalLink size={14} />
                           {t('wakeup.errorUi.completeVerification', '立即验证')}
                         </button>
                         <button
                           className="btn btn-secondary"
-                          onClick={() => copyLink(vDetail.validationUrl!)}
+                          onClick={() => handleCopyValidationUrl(account.id, validationUrl)}
                         >
-                          <Copy size={14} />
-                          {t('wakeup.errorUi.copyValidationUrl', '复制验证地址')}
+                          {copiedValidationUrlAccountId === account.id ? <Check size={14} /> : <Copy size={14} />}
+                          {copiedValidationUrlAccountId === account.id
+                            ? t('common.copied', '已复制')
+                            : t('wakeup.errorUi.copyValidationUrl', '复制验证地址')}
                         </button>
                       </>
                     )}
@@ -1627,10 +1628,12 @@ export function AccountsOverviewView(props: AccountsOverviewViewProps) {
                         </button>
                         <button
                           className="btn btn-secondary"
-                          onClick={() => copyLink(vDetail.appealUrl!)}
+                          onClick={() => handleCopyValidationUrl(account.id, vDetail.appealUrl!)}
                         >
-                          <Copy size={14} />
-                          {t('wakeup.errorUi.copyAppealUrl', '复制链接')}
+                          {copiedValidationUrlAccountId === account.id ? <Check size={14} /> : <Copy size={14} />}
+                          {copiedValidationUrlAccountId === account.id
+                            ? t('common.copied', '已复制')
+                            : t('wakeup.errorUi.copyAppealUrl', '复制链接')}
                         </button>
                       </>
                     )}

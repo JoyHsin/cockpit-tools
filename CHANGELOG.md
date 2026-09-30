@@ -7,6 +7,60 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+
+## [1.3.63] - 2026-09-30
+
+### Added
+
+- Add official GPT-6.1 Sol cost estimates, including cached reads/writes, Fast/Flex rates and long-context pricing.
+
+- Add GPT-6.1 Sol to built-in model catalogs, wakeup/Pelican selection, provider test candidates and native gateway model recognition. Existing default model choices are preserved, and GPT-6.1 Sol supports the `ultra` reasoning effort in wakeup tasks and Pelican tests.
+
+- Model providers offer Pelican tests in the existing dialog, with saved provider/key/model selection, attributed results, shared history and retries. Tests use an isolated temporary gateway and resolve saved credentials again on retry.
+
+### Fixed
+
+- Provider chat tests share the wakeup default model (`gpt-5.6-luna`) for the local Responses gateway and prefer it when available in the provider catalog. Explicit model choices and provider-specific upstream models remain supported.
+
+- Manual quota refresh now reports local proxy errors instead of failing without feedback.
+
+- Antigravity metadata scanning no longer probes WSL paths on Windows, so it cannot start WSL or stall while looking for a local client.
+
+- Pelican results stay on the batch you opened while other batches keep updating, and retrying a failed item resumes that batch instead of switching away.
+
+- Codex account toolbar actions no longer crowd the search and filter fields in narrow windows.
+
+### Changed
+
+- Remove pre-5.5 GPT models from built-in catalogs, provider test candidates and legacy gateway shells. DeepSeek mappings use current shells; historical logs retain their original pricing support.
+
+- Windows builds include an `x64-portable.zip` package with the host application and bundled resources; WebView2 is required and user data remains in the normal Windows profile.
+
+- Codex proxy display styles are selected from the proxy preview; duplicate general and quick-setting controls have been removed.
+
+## [1.3.62] - 2026-09-29
+
+### Fixed
+
+- Fixed Codex provider protocol changes not persisting, explicitly removed API keys returning during account sync, and incorrect image-capability and vision-routing readback.
+- Fixed interrupted model-ID editing and incomplete cancellation rollback in mixed routing; context settings now require explicit model-management opt-in before saving.
+- Fixed rejected DeepSeek Responses tool-search requests and incorrect rewriting of opaque reasoning IDs during protocol conversion.
+- Fixed external account imports inferring or overwriting API endpoints; explicit upstream addresses in imported bundles are preserved.
+- Fixed Antigravity same-email reimports failing to update in place. Legacy IDs, notes and existing bindings are preserved, and read failures do not overwrite the original account.
+- Fixed stale quotas clearing Antigravity verification requirements, verification links selecting the wrong signed-in account, and quota failures for some free accounts.
+- Fixed group edits overwriting Codex quota-refresh policies, concurrent saves losing membership changes, and writes proceeding after failed reads.
+- Fixed API Service automatic recovery clearing exhausted quotas and active cooldowns prematurely, and credential-refresh races during startup. Credential writes are atomic, and refresh shutdown waits for in-flight workers.
+- Fixed global API Service membership rules incorrectly removing account scope from mixed-model instance gateways.
+- Fixed new-api usage treating raw quota counters as money or guessing currency units, and Antigravity personal accounts using enterprise quota endpoints.
+- Fixed local proxy contention being reported as account quota failure. Reads briefly retry busy state, and idle proxy runtime records are safely reclaimed.
+- Fixed Windows Store Codex managed-instance startup and account isolation, keyboard/input-method hangs, and passive path detection unintentionally starting WSL.
+- Fixed working-directory and environment handling when launching Codex CLI through Ghostty. On macOS, credential changes identify a CLI daemon still holding the previous account.
+- Fixed Claude OAuth refreshes overwriting newer credentials; rotated tokens synchronize to bound CLI profiles with bounded Keychain access.
+- Fixed instance deletion handling shared or custom directories incorrectly, repeated scheduled wakeups, and disabled tasks continuing to run.
+- Fixed TOTP countdown updates after closing the dialog, transparent dropdown backgrounds, and controls ignoring theme colors.
+- Fixed API Service action buttons obscuring titles in narrow windows.
+- Fixed Swift runtime discovery with newer Xcode toolchains and automatic updates becoming public before all packages are ready.
+
 ## [1.3.61] - 2026-09-27
 
 ### Added

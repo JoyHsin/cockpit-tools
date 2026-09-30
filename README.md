@@ -358,7 +358,9 @@ Grok CLI 默认实例通常直接沿用官方 `~/.grok` 目录，启动时不设
 前往 [GitHub Releases](https://github.com/jlcodes99/cockpit-tools/releases) 下载对应系统的安装包：
 
 *   **macOS**: `.dmg` (Apple Silicon & Intel)
-*   **Windows**: `.msi` (推荐) 或 `.exe`
+*   **Windows**: `.msi`（推荐）、`.exe`，或 `x64-portable.zip`（解压即用，无需安装）
+
+Windows 便携包解压后直接运行其中的 `Cockpit Tools.exe`（或同名主程序）。系统需要 Windows 10/11 的 Microsoft Edge WebView2 Runtime；账号和配置仍按当前 Windows 用户目录保存，不会随 ZIP 文件夹自动迁移。
 *   **Linux**: `.deb` (Debian/Ubuntu)、`.rpm` 或 `.AppImage` (通用)
 
 ### 选项 B: Homebrew 安装 (macOS)
@@ -462,6 +464,8 @@ QQ 交流群、微信群或新建的 Telegram 畅聊群都可以加入。
 ---
 
 ## 致谢
+
+- 部分账号导入校验、网关凭据读取及稳定性改进参考了 [super-ai-tools](https://github.com/lihah111222333-cloud/super-ai-tools) 的本地保留源码快照；来源与许可见 [来源声明](docs/third-party/super-ai-tools.md)。
 
 - Codex 代理工作台的页面层级、订阅卡片、当前节点展示、分组/节点下拉、延迟徽章与排序、原生测速接口调用、快速切换交互和订阅来源命名参考 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) 的界面及实现思路；仅为设计与实现参考，不是运行时依赖或官方合作。
 - Codex 代理首次绑定的简短操作路径与当前节点展示参考 [Hiddify](https://github.com/hiddify/hiddify-app)；仅参考交互方向，未集成其代码或服务。

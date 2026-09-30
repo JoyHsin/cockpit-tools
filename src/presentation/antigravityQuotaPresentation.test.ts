@@ -9,6 +9,7 @@ import {
   buildAntigravityAccountPresentation,
   buildQuotaPreviewLines,
   getAntigravityQuotaDisplayItems,
+  isAccountNeedsReauth,
 } from './platformAccountPresentation';
 
 const t = ((key: string, defaultValue?: string | Record<string, unknown>) =>
@@ -109,3 +110,42 @@ test('stale summary warns only on cached buckets, including shared presentation 
   const noWarning = renderToStaticMarkup(createElement(AntigravityQuotaSection, { items: noCachedBuckets, t }));
   assert.doesNotMatch(noWarning, /cachedRefreshFailed/);
 });
+
+test('isAccountNeedsReauth accurately identifies re-authorization required accounts', () => {
+  const normalAcc = account([model('claude:weekly', 100)]);
+  assert.equal(isAccountNeedsReauth(normalAcc), false);
+
+  const disabledReasonAcc = { ...normalAcc, disabled_reason: 'verification_required' };
+  assert.equal(isAccountNeedsReauth(disabledReasonAcc), true);
+
+  const invalidGrantAcc = { ...normalAcc, disabled_reason: 'invalid_grant: token revoked' };
+  assert.equal(isAccountNeedsReauth(invalidGrantAcc), true);
+
+  const quotaErrorReasonAcc: Account = {
+    ...normalAcc,
+    quota_error: { code: 403, message: 'Verify your account to continue.', reason: 'VALIDATION_REQUIRED', timestamp: 123 },
+  };
+  assert.equal(isAccountNeedsReauth(quotaErrorReasonAcc), true);
+
+  const validationUrlAcc: Account = {
+    ...normalAcc,
+    quota_error: { code: 403, message: 'Verify', validation_url: 'https://accounts.google.com/signin/continue', timestamp: 123 },
+  };
+  assert.equal(isAccountNeedsReauth(validationUrlAcc), true);
+});
+
+test('AntigravityQuotaSection renders cachedNeedsReauth warning when isNeedsReauth is true', () => {
+  const cached = account([model('gemini-5h', 25)], true);
+  const items = getAntigravityQuotaDisplayItems(cached, []);
+
+  // When isNeedsReauth is true, displays cachedNeedsReauth
+  const htmlReauth = renderToStaticMarkup(createElement(AntigravityQuotaSection, { items, isNeedsReauth: true, t }));
+  assert.match(htmlReauth, /⚠️ 账号需完成网页验证以继续使用/);
+  assert.match(htmlReauth, /quota-reauth-warning/);
+
+  // When isNeedsReauth is false, displays cachedRefreshFailed
+  const htmlNormal = renderToStaticMarkup(createElement(AntigravityQuotaSection, { items, isNeedsReauth: false, t }));
+  assert.match(htmlNormal, /common\.shared\.quota\.cachedRefreshFailed/);
+  assert.doesNotMatch(htmlNormal, /quota-reauth-warning/);
+});
+

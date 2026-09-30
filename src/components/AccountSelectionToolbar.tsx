@@ -16,8 +16,8 @@ export interface AccountSelectionToolbarProps {
 
   /** 通用平台分组 Hook 返回对象，传入后自动在中间渲染分组 Tabs，并在操作栏追加加入/移出分组按钮及自动挂载弹窗 */
   grouping?: UsePlatformAccountGroupsReturn;
-  /** 用于分组 Tabs 统计各组账号数量 */
-  accounts?: Array<{ id: string }>;
+  /** 用于分组 Tabs 统计各组账号数量及分组内添加账号 */
+  accounts?: Array<{ id: string; [key: string]: any }>;
   /** 当前选中的账号 ID 列表，用于加入/移出分组 */
   selectedIds?: string[];
 }
@@ -122,6 +122,7 @@ export function AccountSelectionToolbar({
             onClose={() => grouping.setShowManageModal(false)}
             platform={grouping.platform}
             onGroupsChanged={grouping.reloadGroups}
+            accounts={accounts}
           />
 
           <AddToGroupModal

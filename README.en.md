@@ -361,7 +361,9 @@ Notes:
 Go to [GitHub Releases](https://github.com/jlcodes99/cockpit-tools/releases) to download the package for your system:
 
 *   **macOS**: `.dmg` (Apple Silicon & Intel)
-*   **Windows**: `.msi` (Recommended) or `.exe`
+*   **Windows**: `.msi` (Recommended), `.exe`, or `x64-portable.zip` (extract and run)
+
+Extract the Windows portable archive and run the included `Cockpit Tools.exe` (or the bundled main executable). Windows 10/11 with the Microsoft Edge WebView2 Runtime is required. Accounts and settings remain in the current Windows user's data directory and are not moved with the ZIP folder.
 *   **Linux**: `.deb` (Debian/Ubuntu), `.rpm`, or `.AppImage` (Universal)
 
 ### Option B: Install with Homebrew (macOS)
@@ -459,6 +461,8 @@ Every bit of support helps sustain open-source development. Thank you!
 ---
 
 ## Acknowledgments
+
+- Some account-import validation, gateway credential loading, and reliability improvements reference the retained source snapshot of [super-ai-tools](https://github.com/lihah111222333-cloud/super-ai-tools); see the [source and license notice](docs/third-party/super-ai-tools.md).
 
 - Codex proxy workspace navigation, subscription cards, current-node display, group/node menus, latency badges and sorting, native latency API calls, quick switching and subscription naming reference the interface and implementation in [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev). This is design and implementation inspiration, not a runtime dependency or official partnership.
 - The short first-time proxy binding flow and current-node display for Codex accounts reference [Hiddify](https://github.com/hiddify/hiddify-app). This is interaction inspiration; its code and services are not integrated.

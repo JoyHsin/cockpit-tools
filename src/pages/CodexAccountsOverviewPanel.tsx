@@ -99,6 +99,12 @@ export function CodexAccountsOverviewPanel(props: CodexAccountsViewProps) {
     editingApiKeyCredentialsValue,
     editingApiKeyCredentialsVisible,
     editingApiModelCatalogDraft,
+    editingApiWireApi,
+    editingApiSupportsWebsockets,
+    editingApiCredentialsError,
+    setEditingApiWireApi,
+    setEditingApiSupportsWebsockets,
+    setEditingApiCredentialsError,
     editingApiModelCatalogError,
     editingApiModelCatalogFetching,
     editingApiModelCatalogInput,
@@ -1658,15 +1664,19 @@ export function CodexAccountsOverviewPanel(props: CodexAccountsViewProps) {
                     <div className="oauth-link">
                       <label>{t("codex.modelProviders.fields.wireApi", "协议")}</label>
                       <div className="api-provider-chip-list">
-                        <span className={`api-provider-chip ${selectedEditingManagedProvider?.wireApi !== "chat_completions" ? "active" : ""}`}>
+                        <button type="button" className={`api-provider-chip ${editingApiWireApi === "responses" ? "active" : ""}`}
+                          disabled={savingApiKeyCredentials} aria-pressed={editingApiWireApi === "responses"}
+                          onClick={() => { setEditingApiWireApi("responses"); setEditingApiCredentialsError(null); }}>
                           {t("codex.modelProviders.wireApi.responses", "Responses 原生")}
-                        </span>
-                        <span className={`api-provider-chip ${selectedEditingManagedProvider?.wireApi === "chat_completions" ? "active" : ""}`}>
+                        </button>
+                        <button type="button" className={`api-provider-chip ${editingApiWireApi === "chat_completions" ? "active" : ""}`}
+                          disabled={savingApiKeyCredentials} aria-pressed={editingApiWireApi === "chat_completions"}
+                          onClick={() => { setEditingApiWireApi("chat_completions"); setEditingApiSupportsWebsockets(false); setEditingApiCredentialsError(null); }}>
                           {t("codex.modelProviders.wireApi.chatCompletions", "Chat Completions 协议")}
-                        </span>
+                        </button>
                       </div>
                     </div>
-                    {selectedEditingManagedProvider?.wireApi !== "chat_completions" && (
+                    {editingApiWireApi === "responses" && (
                       <div className="oauth-link">
                         <label>{t("codex.modelProviders.fields.supportsWebsockets", "WebSocket 传输")}</label>
                         <label className="provider-vision-toggle">
@@ -1679,7 +1689,8 @@ export function CodexAccountsOverviewPanel(props: CodexAccountsViewProps) {
                             </span>
                           </span>
                           <span className="provider-vision-switch">
-                            <input type="checkbox" checked={selectedEditingManagedProvider?.supportsWebsockets === true} readOnly />
+                            <input type="checkbox" checked={editingApiSupportsWebsockets} disabled={savingApiKeyCredentials}
+                              onChange={(event) => { setEditingApiSupportsWebsockets(event.target.checked); setEditingApiCredentialsError(null); }} />
                             <span className="provider-vision-switch-track" />
                           </span>
                         </label>
@@ -1826,6 +1837,7 @@ export function CodexAccountsOverviewPanel(props: CodexAccountsViewProps) {
                     )}
                   </div>
                 </div>
+                    <ModalErrorMessage message={editingApiCredentialsError} position="bottom" />
                     <div className="modal-footer api-key-edit-actions">
                       <button
                         className="btn btn-secondary"

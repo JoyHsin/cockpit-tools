@@ -12,6 +12,7 @@ export interface CodexAccountGroupModalProps {
   onClose: () => void;
   onGroupsChanged: () => Promise<void> | void;
   onAddAccounts?: (group: AccountGroup) => void;
+  accounts?: Array<{ id: string; [key: string]: any }>;
 }
 
 export const CodexAccountGroupModal = ({
@@ -19,6 +20,7 @@ export const CodexAccountGroupModal = ({
   onClose,
   onGroupsChanged,
   onAddAccounts,
+  accounts,
 }: CodexAccountGroupModalProps) => {
   return (
     <AccountGroupModal
@@ -27,6 +29,7 @@ export const CodexAccountGroupModal = ({
       onGroupsChanged={onGroupsChanged}
       platform="codex"
       onAddAccounts={onAddAccounts}
+      accounts={accounts}
     />
   );
 };

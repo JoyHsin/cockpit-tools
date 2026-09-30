@@ -43,7 +43,7 @@ function cloneGroups(groups: AccountGroup[]): AccountGroup[] {
   }));
 }
 
-function parseGroups(raw: string): AccountGroup[] {
+export function parseAccountGroups(raw: string): AccountGroup[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -88,7 +88,7 @@ function parseGroups(raw: string): AccountGroup[] {
 async function loadGroupsFromDisk(): Promise<AccountGroup[]> {
   try {
     const raw: string = await invoke('load_account_groups');
-    return parseGroups(raw);
+    return parseAccountGroups(raw);
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('[AccountGroups]')) {
       throw error;
@@ -190,16 +190,21 @@ export function addAccountsToGroup(groupId: string, accountIds: string[]): Promi
   return enqueue(() => assignAccountsToGroupInternal(groupId, accountIds));
 }
 
+export function setGroupAccounts(groupId: string, accountIds: string[]): Promise<AccountGroup | null> {
+  return enqueue(async () => {
+    const groups = await loadGroups();
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) return null;
+    group.accountIds = Array.from(new Set(accountIds));
+    await saveGroups(groups);
+    return group;
+  });
+}
+
 async function assignAccountsToGroupInternal(groupId: string, accountIds: string[]): Promise<AccountGroup | null> {
   const groups = await loadGroups();
   const group = groups.find((g) => g.id === groupId);
   if (!group) return null;
-  const targetIds = new Set(accountIds);
-
-  for (const currentGroup of groups) {
-    if (currentGroup.id === groupId) continue;
-    currentGroup.accountIds = currentGroup.accountIds.filter((id) => !targetIds.has(id));
-  }
 
   const existing = new Set(group.accountIds);
   for (const id of accountIds) {
